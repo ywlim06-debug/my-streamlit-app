@@ -1,13 +1,12 @@
 # app.py
 # Streamlit + OpenAI Responses API 기반: "돌다리" (질문 기반 AI 결정 코칭)
-# 개선 사항:
-# 1) 질문별 text_area key를 분리해서 이전 질문 답변이 다음 질문 입력칸에 남지 않음
-# 2) 질문을 한 번에 N개 고정 생성하지 않고, 답변을 반영해 다음 질문을 단계별로 생성(동적 질문)
+# Streamlit Community Cloud 배포용 수정:
+# 1) os.environ 대신 st.secrets["OPENAI_API_KEY"] 사용
+# 2) Google Colab 관련 코드 제거 (userdata 등)  -> (이 코드에는 원래 없지만, 추가 의존/분기 전부 배제)
 
 from __future__ import annotations
 
 import json
-import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,6 +40,18 @@ DEFAULT_NUM_QUESTIONS = 7
 # -----------------------------
 def safe_strip(x: str) -> str:
     return (x or "").strip()
+
+
+def get_secret_api_key() -> str:
+    """
+    Streamlit Cloud에서는 Secrets에 OPENAI_API_KEY를 넣어 사용합니다.
+    - Settings > Secrets 에 다음 형태로 저장:
+      OPENAI_API_KEY = "sk-..."
+    """
+    try:
+        return str(st.secrets["OPENAI_API_KEY"])
+    except Exception:
+        return ""
 
 
 def get_client(api_key: str) -> OpenAI:
@@ -134,14 +145,12 @@ def build_next_question_prompt(
         "이미 물어본 내용은 반복하지 말고, 사용자의 이전 답변에서 드러난 포인트를 한 단계 더 깊게 탐색하라."
     )
 
-    # 지금까지 Q/A 정리
     qa_lines = []
     for i, q in enumerate(questions_so_far, start=1):
         a = safe_strip(answers_so_far.get(i, ""))
         qa_lines.append(f"Q{i}. {q}\nA{i}. {a}")
     qa_block = "\n\n".join(qa_lines) if qa_lines else "(아직 없음)"
 
-    # 단계 가이드(너무 딱딱하게 고정하지 않고 "가급적" 흐름만 유지)
     user = f"""
 [선택 주제]
 {safe_strip(situation_title)}
@@ -271,12 +280,23 @@ ss: SessionState = st.session_state.ss
 # -----------------------------
 with st.sidebar:
     st.markdown("### 설정")
-    api_key = st.text_input(
-        "OpenAI API Key",
-        value=os.getenv("OPENAI_API_KEY", ""),
-        type="password",
-        help="배포 시 st.secrets 또는 환경변수 OPENAI_API_KEY 사용 권장",
-    )
+
+    # ✅ Streamlit Cloud: Secrets에서 키를 읽고, 사용자 입력창은 "선택 사항"
+    secret_api_key = get_secret_api_key()
+    if secret_api_key:
+        st.success("OPENAI_API_KEY: Secrets에서 로드됨 ✅")
+    else:
+        st.warning("OPENAI_API_KEY가 Secrets에 없습니다. (Cloud 배포 시 반드시 설정)")
+
+    # 로컬 테스트 편의용: Secrets가 없을 때만 입력받기 (Cloud에서도 원하면 켤 수 있음)
+    allow_manual_key = st.toggle("로컬 테스트용: 직접 키 입력", value=False, help="Secrets가 없을 때만 사용 권장")
+    manual_api_key = ""
+    if allow_manual_key:
+        manual_api_key = st.text_input("OpenAI API Key", value="", type="password")
+
+    # 실제 사용 키 결정: Secrets 우선
+    api_key = secret_api_key or manual_api_key
+
     ss.model = st.text_input("모델", value=ss.model)
     ss.total_steps = st.slider("돌(질문) 개수", min_value=5, max_value=12, value=int(ss.total_steps))
 
@@ -370,14 +390,13 @@ elif ss.stage == "setup":
     with cols[1]:
         if st.button("🧱 시작(첫 질문 생성)", type="primary", use_container_width=True, disabled=not can_start):
             if not api_key:
-                st.error("사이드바에 OpenAI API Key를 입력해 주세요.")
+                st.error("OPENAI_API_KEY가 필요합니다. Streamlit Cloud에서는 Secrets에 설정해 주세요.")
             else:
-                # 초기화
                 ss.questions = []
                 ss.answers = {}
                 ss.current_idx = 1
                 ss.summary_md = ""
-                # 위젯 키 초기화
+
                 for k in list(st.session_state.keys()):
                     if str(k).startswith("answer_"):
                         del st.session_state[k]
@@ -420,9 +439,8 @@ elif ss.stage == "questions":
     q = ss.questions[idx - 1]
     st.markdown(f"### 🪨 {q}")
 
-    # ✅ 핵심 수정: 질문별로 key 분리
+    # 질문별 key 분리
     widget_key = f"answer_{idx}"
-    # 해당 질문의 저장된 답변이 있으면 초기값으로 동기화(처음만)
     if widget_key not in st.session_state:
         st.session_state[widget_key] = ss.answers.get(idx, "")
 
@@ -433,7 +451,6 @@ elif ss.stage == "questions":
         placeholder="떠오르는 대로 적어도 괜찮아요.",
     )
 
-    # 항상 세션 답변 저장
     ss.answers[idx] = answer
 
     nav1, nav2, nav3, nav4 = st.columns([1, 1, 2, 2])
@@ -446,13 +463,12 @@ elif ss.stage == "questions":
     with nav2:
         must_answer = len(safe_strip(answer)) == 0
 
-        # 다음 질문으로
         if idx < total_steps:
             if st.button("다음 ➡️", type="primary", use_container_width=True, disabled=must_answer):
-                # 아직 다음 질문이 생성되지 않았다면(처음 도달) -> 동적으로 생성
+                # 아직 다음 질문이 생성되지 않았다면 동적 생성
                 if idx == len(ss.questions):
                     if not api_key:
-                        st.error("사이드바에 OpenAI API Key를 입력해 주세요.")
+                        st.error("OPENAI_API_KEY가 필요합니다. Streamlit Cloud에서는 Secrets에 설정해 주세요.")
                     else:
                         with st.spinner("다음 질문을 만드는 중... (이전 답변 반영)"):
                             client = get_client(api_key)
@@ -471,7 +487,6 @@ elif ss.stage == "questions":
                                 next_q = safe_strip(str(parsed.get("question", "")))
 
                             if not next_q:
-                                # 안전한 폴백
                                 fallback = [
                                     "결정에 영향을 주는 현실 조건은?",
                                     "가장 중요한 가치/우선순위는?",
@@ -485,16 +500,12 @@ elif ss.stage == "questions":
                             ss.questions.append(next_q)
 
                 ss.current_idx = idx + 1
-
-                # ✅ 다음 질문칸이 이전 답변으로 안 채워지도록
-                # 새 질문으로 이동하는 순간 그 질문 key가 없으면 빈 값으로 시작하도록 유지
-                # (위에서 key 없을 때만 answers.get(idx,"")를 넣으므로, 새 질문은 자동으로 빈 값)
                 st.rerun()
+
         else:
-            # 마지막 단계: 요약 생성
             if st.button("✅ 건너기 완료", type="primary", use_container_width=True, disabled=must_answer):
                 if not api_key:
-                    st.error("사이드바에 OpenAI API Key를 입력해 주세요.")
+                    st.error("OPENAI_API_KEY가 필요합니다. Streamlit Cloud에서는 Secrets에 설정해 주세요.")
                 else:
                     with st.spinner("생각을 정리하는 중... (요약 생성)"):
                         client = get_client(api_key)
