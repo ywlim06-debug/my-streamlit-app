@@ -3,13 +3,15 @@
 # 🪨 돌멩이 결정 코치 (Pebble Decision Coach)
 #
 # 요청 반영:
-# 1) 질문 개수 사용자가 설정 가능 (2~10)
-# 2) 질문이 끝나면 "다음 페이지(최종 레포트)"로 이동해서 결과 표시
-#    - Streamlit 멀티페이지 기능 없이, session_state 기반 라우팅으로 구현
-# 3) 이전 답변을 기억하고 다음 질문에 반영
-# 4) 질문 중복 방지(이전 질문과 유사하면 1회 재생성 + fallback)
-# 5) SVG는 st.image()가 아니라 base64 HTML <img>로 렌더링(PIL 오류 방지)
-# 6) Streamlit Cloud: st.secrets["OPENAI_API_KEY"] 우선 사용
+# - 질문 개수 설정(2~10)
+# - 질문 완료 후 "레포트 페이지"로 이동(session_state 라우팅)
+# - 질문 중복 방지(유사하면 1회 재생성 + fallback)
+# - 실행 코치 진행 방식 강화:
+#   1) 우선순위 정하기(가치/효과/난이도 기준)
+#   2) 계획 질문 추가: 년 → 달 → 주(목표를 쪼개는 질문)
+#   3) If-Then, 장애물 대응, 7일 실험, 체크리스트
+# - Streamlit Cloud: st.secrets["OPENAI_API_KEY"] 우선
+# - SVG는 base64 HTML로 렌더링(PIL 오류 방지)
 #
 # 필요 패키지:
 #   pip install streamlit openai
@@ -70,7 +72,7 @@ COACHES = [
             "장단점·리스크·가정 검증",
             "결론 + 선택 근거",
         ],
-        "prompt_hint": "MECE, 의사결정 기준표, 리스크/가정 검증 질문",
+        "prompt_hint": "MECE, 기준표, 리스크/가정 검증",
     },
     {
         "id": "value",
@@ -88,21 +90,22 @@ COACHES = [
     {
         "id": "action",
         "name": "⚔️ 실행 코치",
-        "tagline": "결정을 실행 가능한 행동으로 바꿉니다",
-        "style": "구체적/실행/작은 실험",
+        "tagline": "결정을 실행 가능한 행동·계획으로 바꿉니다",
+        "style": "구체적/우선순위/계획(년→달→주)/작은 실험",
         "method": [
-            "7일 안에 할 수 있는 실험 설계",
-            "최소 행동(15분) + 체크리스트",
-            "장애물/대응계획(If-Then)",
-            "실행 후 리뷰 질문",
+            "우선순위 정하기: 효과/중요도/난이도 기준으로 1~3개 선정",
+            "큰 목표를 계획으로 쪼개기: 년 → 달 → 주 단위로 구체화",
+            "7일 실험 1~2개 설계(15~30분 단위로 시작)",
+            "장애물/대응계획(If-Then) 정리",
+            "실행 후 리뷰 질문(무엇이 작동/방해했는가)",
         ],
-        "prompt_hint": "작은 실험, 일정/루틴, 장애물 대응",
+        "prompt_hint": "우선순위, 로드맵(년→달→주), 7일 실험, If-Then",
     },
 ]
 
 
 # =========================
-# Pebble (Rock) UI: SVG → base64 HTML img (no PIL)
+# Pebble UI (SVG -> base64 HTML)
 # =========================
 def _pebble_svg(fill: str, shine: str, stroke: str = "#3a3a3a") -> str:
     return f"""
@@ -129,8 +132,7 @@ def _pebble_svg(fill: str, shine: str, stroke: str = "#3a3a3a") -> str:
 def pebble_svg_b64(progress_0_to_1: float, inactive: bool = False) -> str:
     p = max(0.0, min(1.0, float(progress_0_to_1)))
     if inactive:
-        fill = "#2f3136"
-        shine = "#6b6f7a"
+        fill, shine = "#2f3136", "#6b6f7a"
     else:
         fill = "#5f6672" if p < 0.25 else "#707888" if p < 0.5 else "#8892a6" if p < 0.75 else "#a6b2c8"
         shine = "#aab8ff" if p < 0.25 else "#c8d3ff" if p < 0.5 else "#e3e8ff" if p < 0.75 else "#ffffff"
@@ -169,7 +171,7 @@ def render_hero_pebble(progress: float, label: str) -> None:
 
 
 # =========================
-# OpenAI Helpers
+# OpenAI helpers
 # =========================
 def get_api_key() -> str:
     try:
@@ -198,7 +200,6 @@ def call_openai_text(system: str, user: str, temperature: float = 0.7) -> Tuple[
     except Exception as e:
         return None, str(e), debug
 
-    # Responses API 우선
     if hasattr(client, "responses"):
         for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
             try:
@@ -226,7 +227,6 @@ def call_openai_text(system: str, user: str, temperature: float = 0.7) -> Tuple[
             except Exception as e:
                 debug.append(f"Responses failed: {type(e).__name__}: {e}")
 
-    # Chat Completions fallback
     for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
         try:
             debug.append(f"Chat Completions / model={model}")
@@ -248,7 +248,7 @@ def call_openai_text(system: str, user: str, temperature: float = 0.7) -> Tuple[
 
 
 # =========================
-# Routing / State
+# State + routing
 # =========================
 def init_state() -> None:
     if "page" not in st.session_state:
@@ -267,9 +267,9 @@ def init_state() -> None:
         st.session_state.q_index = 0
 
     if "questions" not in st.session_state:
-        st.session_state.questions = []  # generated questions
+        st.session_state.questions = []
     if "answers" not in st.session_state:
-        st.session_state.answers = []  # [{"q","a","ts"}]
+        st.session_state.answers = []
 
     if "final_report" not in st.session_state:
         st.session_state.final_report = None
@@ -317,21 +317,20 @@ def system_prompt_for(coach: Dict[str, Any]) -> str:
             "- 가치(중요한 것)를 3개로 좁히고, 후회 최소화 관점 질문을 포함하세요.\n"
         )
     return (
-        "당신은 '실행 코치'입니다. 목표는 결정을 실행 가능한 실험과 다음 행동으로 바꾸는 것입니다.\n"
-        "- 7일 안에 할 수 있는 작은 실험 1~2개를 설계하게 하세요.\n"
-        "- 장애물과 If-Then 대응을 구체화하세요.\n"
+        "당신은 '실행 코치'입니다. 목표는 결정을 실행 가능한 계획과 행동으로 바꾸는 것입니다.\n"
+        "- 반드시 우선순위를 정하게 하세요(효과/중요도/난이도 기준).\n"
+        "- 큰 목표를 년→달→주 단위로 쪼개 구체화하게 하세요.\n"
+        "- 7일 실험 1~2개와 If-Then(장애물 대응)을 포함하세요.\n"
+        "- 질문은 짧고, 바로 실행할 수 있는 답을 끌어내는 형태로 구성하세요.\n"
     )
 
 
 def build_context_block() -> str:
     cat = st.session_state.category
     dtype = st.session_state.decision_type
-
-    # 최근 답변 일부만 컨텍스트로 (너무 길어지지 않게)
     hist = ""
     for i, qa in enumerate(st.session_state.answers[-6:], start=1):
         hist += f"{i}) Q: {qa['q']}\n   A: {qa['a']}\n"
-
     return textwrap.dedent(f"""
     [고민 카테고리]
     {cat}
@@ -376,36 +375,49 @@ def is_similar(a: str, b: str) -> bool:
 
 
 def instruction_for_question(i: int, n: int, coach_id: str) -> str:
-    # i: 0-based
+    """
+    질문을 n개로 늘려도 각 질문이 역할이 겹치지 않도록 설계.
+    실행 코치는 우선순위 + 년→달→주 계획 질문이 중간에 반드시 나오도록 구성.
+    """
+    # 공통 시작 2개
     if i == 0:
         return "상황을 구체적으로 파악하는 질문 1개를 작성하세요."
     if i == 1:
         return "원하는 결과와 피하고 싶은 결과를 분리해 드러내는 질문 1개를 작성하세요."
+
+    # 실행 코치 전용: 우선순위/로드맵 질문을 강제 배치
+    if coach_id == "action":
+        # i=2: 우선순위
+        if i == 2:
+            return "해야 할 것(또는 옵션)들을 3~6개로 나열하고, 효과/중요도/난이도로 우선순위 1~3개를 고르게 하는 질문 1개를 작성하세요."
+        # i=3: 년→달→주 로드맵
+        if i == 3 and n >= 5:
+            return "우선순위 1개를 기준으로 목표를 년→달→주로 쪼개 계획을 세우게 하는 질문 1개를 작성하세요."
+        # 중반(마지막 2개 이전): 7일 실험/첫 행동
+        if i < n - 2:
+            return "이번 주에 할 수 있는 7일 실험(1개)과 시작 행동(15~30분)을 구체화하게 하는 질문 1개를 작성하세요."
+        # 마지막 2개: 장애물 If-Then, 실행 약속
+        if i == n - 2:
+            return "장애물 3가지를 예상하고 If-Then(만약~이면→~한다) 대응을 만들게 하는 질문 1개를 작성하세요."
+        return "실행 약속을 한 문장으로 고정하게 하는 질문 1개(언제/어디서/몇 분/무엇을) 작성하세요."
+
+    # 논리/가치 코치: 기존 흐름
     if i == 2 and n >= 4:
         return "제약(시간/돈/관계/규칙)과 바꿀 수 없는 조건을 명확히 하는 질문 1개를 작성하세요."
 
-    # 중간 질문(코치별 차별화)
     if i < n - 2:
         if coach_id == "logic":
             return "옵션을 나누고 평가 기준(3~5)을 설정하게 하는 질문 1개를 작성하세요. (표로 정리 가능하게)"
-        if coach_id == "value":
-            return "가치 우선순위(상위 3개)와 감정/욕구/두려움을 드러내는 질문 1개를 작성하세요."
-        return "이번 주에 할 수 있는 작은 실험(15분 단위) 또는 첫 행동을 고르게 하는 질문 1개를 작성하세요."
+        return "가치 우선순위(상위 3개)와 감정/욕구/두려움을 드러내는 질문 1개를 작성하세요."
 
-    # 마지막 2개
     if i == n - 2:
         if coach_id == "logic":
             return "가정/리스크를 검증하고 플랜B를 떠올리게 하는 질문 1개를 작성하세요."
-        if coach_id == "value":
-            return "후회 최소화 관점(1년/5년 후)을 점검하는 질문 1개를 작성하세요."
-        return "장애물과 If-Then 대응을 구체화하는 질문 1개를 작성하세요."
+        return "후회 최소화 관점(1년/5년 후)을 점검하는 질문 1개를 작성하세요."
 
-    # 마지막 질문
     if coach_id == "logic":
         return "결정을 내리기 위한 최종 확인 질문 1개(가정/리스크/대안 중 하나에 초점)를 작성하세요."
-    if coach_id == "value":
-        return "결정 문장을 한 줄로 완성하게 하는 질문 1개를 작성하세요. (나는 ___를 위해 ___을 선택한다)"
-    return "실행 약속을 한 문장으로 고정하게 하는 질문 1개(언제/어디서/몇 분/무엇을)를 작성하세요."
+    return "결정 문장을 한 줄로 완성하게 하는 질문 1개를 작성하세요. (나는 ___를 위해 ___을 선택한다)"
 
 
 def fallback_question(coach_id: str, i: int, n: int) -> str:
@@ -413,21 +425,28 @@ def fallback_question(coach_id: str, i: int, n: int) -> str:
         return "지금 고민 상황을 한 문단으로 설명해 주세요. (무슨 일이 있었고, 무엇을 결정해야 하나요?)"
     if i == 1:
         return "이 결정에서 얻고 싶은 최선의 결과 1가지와 피하고 싶은 최악의 결과 1가지는 무엇인가요?"
+
+    if coach_id == "action":
+        if i == 2:
+            return "해야 할 일(또는 옵션)을 3~6개 적고, 그중 가장 효과가 큰 1~3개를 우선순위로 고르면 무엇인가요?"
+        if i == 3 and n >= 5:
+            return "우선순위 1개를 ‘1년 목표 → 이번 달 목표 → 이번 주 할 일’로 쪼개면 각각 무엇인가요?"
+        if i == n - 2:
+            return "이번 주 실행을 방해할 장애물 3가지를 적고, 각각에 대해 ‘만약 ~이면 → ~한다’로 대응을 만들어보면요?"
+        if i == n - 1:
+            return "이번 주 첫 행동을 ‘언제/어디서/몇 분/무엇을’ 한 문장으로 적어 주세요."
+        return "이번 주에 할 7일 실험 1개와, 오늘 15~30분 안에 할 시작 행동은 무엇인가요?"
+
+    # logic/value 공통 fallback
     if i == 2 and n >= 4:
         return "시간/돈/관계/규칙 측면에서 바꿀 수 없는 제약 2가지는 무엇인가요?"
-
     if i == n - 1:
         if coach_id == "logic":
             return "이 결정을 내리기 전에 확인해야 할 가장 큰 가정 1개와, 그 가정이 틀렸을 때의 대안(플랜B)은 무엇인가요?"
-        if coach_id == "value":
-            return "‘나는 ___를 위해 ___을 선택한다’ 문장을 완성하면, 빈칸에 무엇이 들어가나요?"
-        return "이번 주 안에 실행할 첫 행동을 ‘언제/어디서/몇 분/무엇을’ 한 문장으로 적어 주세요."
-
+        return "‘나는 ___를 위해 ___을 선택한다’ 문장을 완성하면, 빈칸에 무엇이 들어가나요?"
     if coach_id == "logic":
         return "선택 기준 3개를 정해보면 무엇인가요? (예: 성장/비용/리스크)"
-    if coach_id == "value":
-        return "이 고민에서 가장 중요한 가치 3개는 무엇인가요? (예: 안정/성장/관계)"
-    return "이번 주에 15분 안에 시작할 수 있는 가장 작은 행동은 무엇인가요?"
+    return "이 고민에서 가장 중요한 가치 3개는 무엇인가요? (예: 안정/성장/관계)"
 
 
 def generate_question(i: int, n: int) -> Tuple[str, Optional[str], List[str]]:
@@ -489,7 +508,7 @@ def ensure_question(index: int, total: int) -> None:
 
 
 # =========================
-# Final Report
+# Final report
 # =========================
 def generate_final_report() -> Tuple[Optional[str], Optional[str], List[str]]:
     coach = coach_by_id(st.session_state.coach_id)
@@ -538,14 +557,22 @@ def generate_final_report() -> Tuple[Optional[str], Optional[str], List[str]]:
 - ...
 """
     else:
+        # 실행 코치는 년→달→주 계획을 레포트에서도 강하게
         format_spec = """
 출력 형식:
-## 결정을 행동으로 바꾸기
-- 이번 주 핵심 목표(1개): ...
+## 우선순위(Top 1~3)
+- 1) ...
+- 2) ...
+- 3) ...
+
+## 목표 로드맵(년 → 달 → 주)
+- 1년 목표(1개):
+- 이번 달 목표(1개):
+- 이번 주 계획(3~5개):
 
 ## 7일 실험(1~2개)
-- 실험1: (15분 단위로 쪼개서)
-- 실험2(선택): ...
+- 실험1: (시작 행동 15~30분 포함)
+- 실험2(선택):
 
 ## If-Then 대응표
 - 만약 ___이면 → ___한다 (3개)
@@ -553,9 +580,8 @@ def generate_final_report() -> Tuple[Optional[str], Optional[str], List[str]]:
 ## 오늘(24시간 내) 체크리스트
 - [ ] ...
 - [ ] ...
-- [ ] ...
 
-## 리뷰 질문(실험 후)
+## 리뷰 질문
 - ...
 """
 
@@ -570,7 +596,7 @@ def generate_final_report() -> Tuple[Optional[str], Optional[str], List[str]]:
 - 한국어
 - 선택을 강요하지 말고, 근거와 다음 스텝을 명확히
 - 불확실한 부분은 '추가 확인 질문' 1개를 마지막에 제안
-- 길이: 600~1100자
+- 길이: 700~1200자
 
 [설정]
 - 카테고리: {st.session_state.category}
@@ -594,7 +620,6 @@ def generate_final_report() -> Tuple[Optional[str], Optional[str], List[str]]:
 # =========================
 init_state()
 
-# Sidebar controls
 with st.sidebar:
     st.header("설정")
     st.text_input("OpenAI API Key (Secrets 우선)", type="password", key="openai_api_key_input")
@@ -607,8 +632,8 @@ with st.sidebar:
     st.divider()
     st.subheader("코치 선택")
     coach_labels = [f"{c['name']} — {c['tagline']}" for c in COACHES]
-    current_idx = next((i for i, c in enumerate(COACHES) if c["id"] == st.session_state.coach_id), 0)
-    picked = st.radio("코치", coach_labels, index=current_idx)
+    cur = next((i for i, c in enumerate(COACHES) if c["id"] == st.session_state.coach_id), 0)
+    picked = st.radio("코치", coach_labels, index=cur)
     st.session_state.coach_id = COACHES[coach_labels.index(picked)]["id"]
 
     coach = coach_by_id(st.session_state.coach_id)
@@ -634,29 +659,26 @@ with st.sidebar:
                 reset_flow("questions")
                 st.rerun()
         elif st.session_state.page == "questions":
-            done = len(st.session_state.answers) >= st.session_state.num_questions
+            done = len(st.session_state.answers) >= int(st.session_state.num_questions)
             if st.button("최종 레포트로", use_container_width=True, disabled=not done):
                 st.session_state.page = "report"
                 st.rerun()
-        else:  # report
+        else:
             if st.button("질문 페이지로", use_container_width=True):
                 st.session_state.page = "questions"
                 st.rerun()
 
-
-# Progress labels: Setup + Q1..Qn + Report
+# Progress bar labels
 nq = int(st.session_state.num_questions)
 progress_labels = ["설정"] + [f"Q{i}" for i in range(1, nq + 1)] + ["레포트"]
 
 if st.session_state.page == "setup":
     current_progress = 0
 elif st.session_state.page == "questions":
-    # q_index is 0..n-1, map to 1..n
     current_progress = 1 + int(st.session_state.q_index)
 else:
-    current_progress = 1 + nq  # report
+    current_progress = 1 + nq
 
-# Render progress
 render_pebble_row(current_progress, len(progress_labels), progress_labels)
 
 progress = current_progress / max(1, (len(progress_labels) - 1))
@@ -665,44 +687,36 @@ with st.columns([1, 2, 1])[1]:
 
 st.divider()
 
-# =========================
-# Page: Setup
-# =========================
+# Pages
+coach = coach_by_id(st.session_state.coach_id)
+
 if st.session_state.page == "setup":
     st.title("🪨 돌멩이 결정 코치")
-    st.caption("질문 개수를 선택하고, 질문에 답한 뒤, 마지막 페이지에서 최종 레포트를 확인합니다.")
+    st.caption("질문 개수를 설정하고 시작하세요. 질문이 끝나면 자동으로 레포트 페이지로 이동합니다.")
 
     cat_desc = next((d for n, d in TOPIC_CATEGORIES if n == st.session_state.category), "")
     st.info(f"**카테고리:** {st.session_state.category}\n\n{cat_desc}")
     st.write(f"**결정 유형:** {st.session_state.decision_type}")
-    st.write(f"**선택한 코치:** {coach_by_id(st.session_state.coach_id)['name']}")
+    st.write(f"**선택한 코치:** {coach['name']}")
     st.write(f"**질문 개수:** {nq}개")
-
     st.success("사이드바에서 ‘질문 시작’을 누르면 질문 페이지로 이동합니다.")
 
-# =========================
-# Page: Questions
-# =========================
 elif st.session_state.page == "questions":
     st.title("질문")
-    st.caption("질문에 답하면 자동으로 다음 질문으로 이동합니다. 답변은 저장됩니다.")
-
-    # Ensure current question exists
-    if st.session_state.q_index < nq:
-        ensure_question(st.session_state.q_index, nq)
-    else:
-        # Safety: if index drifted, clamp
-        st.session_state.q_index = nq - 1
-        ensure_question(st.session_state.q_index, nq)
+    st.caption("답변을 저장하면 다음 질문으로 이동합니다.")
 
     q_idx = int(st.session_state.q_index)
+    if q_idx >= nq:
+        st.session_state.q_index = nq - 1
+        q_idx = nq - 1
+
+    ensure_question(q_idx, nq)
     current_q = st.session_state.questions[q_idx]
 
     st.subheader(f"Q{q_idx + 1} / {nq}")
     with st.container(border=True):
         st.markdown(f"**{current_q}**")
 
-    # Answer form
     with st.form(f"answer_form_{q_idx}", clear_on_submit=True):
         hint = ""
         if st.session_state.answers:
@@ -717,7 +731,6 @@ elif st.session_state.page == "questions":
         else:
             add_answer(current_q, answer.strip())
 
-            # 다음 질문으로 이동 or 레포트 페이지로 이동
             if len(st.session_state.answers) >= nq:
                 st.session_state.page = "report"
                 st.session_state.q_index = nq - 1
@@ -725,7 +738,6 @@ elif st.session_state.page == "questions":
                 st.session_state.q_index += 1
             st.rerun()
 
-    # History
     with st.expander("답변 기록 보기"):
         if not st.session_state.answers:
             st.caption("아직 답변이 없습니다.")
@@ -739,18 +751,10 @@ elif st.session_state.page == "questions":
     with st.expander("디버그 로그(문제 발생 시 확인)"):
         st.write(st.session_state.debug_log)
 
-    done = len(st.session_state.answers) >= nq
-    if done:
-        st.success("모든 질문이 완료되었습니다. 사이드바에서 ‘최종 레포트로’를 누르거나 자동으로 레포트 페이지로 이동합니다.")
-
-# =========================
-# Page: Report
-# =========================
 else:
     st.title("최종 정리 레포트")
-    st.caption("질문과 답변을 바탕으로 코치 스타일에 맞춘 최종 정리를 생성합니다.")
+    st.caption("질문과 답변을 바탕으로 최종 정리를 생성합니다.")
 
-    coach = coach_by_id(st.session_state.coach_id)
     st.info(
         f"- **카테고리:** {st.session_state.category}\n"
         f"- **결정 유형:** {st.session_state.decision_type}\n"
@@ -758,7 +762,6 @@ else:
         f"- **질문 개수:** {nq}개"
     )
 
-    # If not enough answers, 안내하고 질문 페이지로 유도
     if len(st.session_state.answers) < nq:
         st.warning("아직 모든 질문이 완료되지 않았습니다. 질문 페이지로 돌아가 답변을 완료하세요.")
         if st.button("질문 페이지로 이동", type="primary"):
@@ -766,11 +769,10 @@ else:
             st.rerun()
         st.stop()
 
-    # Generate report button + cached report
-    cols = st.columns([1, 1])
-    with cols[0]:
+    colA, colB = st.columns([1, 1])
+    with colA:
         gen = st.button("레포트 생성/새로고침", type="primary", use_container_width=True)
-    with cols[1]:
+    with colB:
         if st.button("새 고민 시작", use_container_width=True):
             reset_flow("setup")
             st.rerun()
