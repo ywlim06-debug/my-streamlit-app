@@ -1,17 +1,18 @@
 # app.py
 # ─────────────────────────────────────────────────────────────
-# 🪨 돌멩이 결정 코치 (Pebble Decision Coach) — Personalized Report + Visualization
+# 🪨 돌멩이 AI 결정 코칭 (질문으로 정리하는 앱) + "돌다리 건너는 사람" 진행 애니메이션
 #
-# 추가 반영:
-# - 최종 리포트를 "구조화 JSON"으로 생성 → Streamlit에서 시각화(우선순위/로드맵/주간 플랜)
-# - 특히 실행 코치(action) 선택 시:
-#   * 우선순위 Top1~3 표
-#   * 년→달→주 로드맵 표
-#   * 이번 주 계획(요일별) 테이블(간단 캘린더 느낌)
-#   * If-Then 대응표 + 체크리스트
-# - 논리/가치 코치는 JSON을 텍스트 중심으로 보여주되, 핵심 항목을 카드/표 형태로 정리
+# 계획서 준수:
+# - 정답/결론/추천 제공 금지(강제)
+# - 한 화면에 한 질문씩
+# - 이전 답변 반영 동적 질문
+# - 마지막: 고민의 핵심 / 선택 기준 / 코칭 메시지(추천 금지)
+# - 계획 시각화는 "사용자 답변 기반 정리"만
 #
-# 필요 패키지:
+# 추가 기능:
+# - 돌멩이 위를 사람이 건너는 진행 UI (질문 넘어갈 때마다 이동)
+#
+# 필요:
 #   pip install streamlit openai
 # ─────────────────────────────────────────────────────────────
 
@@ -36,7 +37,7 @@ except Exception:
 # =========================
 # Config
 # =========================
-st.set_page_config(page_title="돌멩이 결정 코치", page_icon="🪨", layout="wide")
+st.set_page_config(page_title="돌멩이 AI 결정 코칭", page_icon="🪨", layout="wide")
 
 MODEL_PRIMARY = "gpt-5-mini"
 MODEL_FALLBACK = "gpt-4o-mini"
@@ -61,49 +62,45 @@ DECISION_TYPES = [
 COACHES = [
     {
         "id": "logic",
-        "name": "🔎 논리 코치",
-        "tagline": "정보를 구조화해서 결정을 명료하게 돕습니다",
-        "style": "논리적/간결/프레임워크 중심",
+        "name": "🔎 구조 코치",
+        "tagline": "정보를 구조화하는 질문으로 정리를 돕습니다",
+        "style": "프레임워크/기준 분해/명료화",
         "method": [
-            "핵심 쟁점·제약조건 정의",
-            "옵션/기준/가중치 정리",
-            "장단점·리스크·가정 검증",
-            "결론 + 선택 근거",
+            "상황·제약·옵션을 분리해서 적게 하기",
+            "선택 기준(3~5)을 뽑아 우선순위를 확인하기",
+            "가정/불확실성을 드러내 추가 질문 찾기",
         ],
-        "prompt_hint": "MECE, 기준표, 리스크/가정 검증",
+        "prompt_hint": "MECE, 기준 목록, 불확실성 질문",
     },
     {
         "id": "value",
-        "name": "💗 가치/감정 코치",
-        "tagline": "감정과 가치관을 명료화해 ‘나다운 선택’을 돕습니다",
-        "style": "공감/가치관/감정 명료화",
+        "name": "💗 가치 코치",
+        "tagline": "감정과 가치관을 드러내는 질문으로 정리를 돕습니다",
+        "style": "공감/가치 우선순위/후회 최소화 질문",
         "method": [
-            "감정/두려움/기대 분해",
-            "진짜 원하는 것(가치) 발굴",
-            "후회 최소화 관점(미래의 나) 질문",
-            "나답게 선택하는 문장 만들기",
+            "감정 라벨링(지금 느끼는 것) → 핵심 욕구 찾기",
+            "가치 Top3 도출(내게 중요한 것)",
+            "후회 최소화 관점 질문으로 기준 정리",
         ],
-        "prompt_hint": "감정 라벨링, 가치 우선순위, 후회 테스트",
+        "prompt_hint": "감정 라벨링, 가치 Top3, 미래의 나 질문",
     },
     {
         "id": "action",
         "name": "⚔️ 실행 코치",
-        "tagline": "결정을 실행 가능한 행동·계획으로 바꿉니다",
-        "style": "구체적/우선순위/계획(년→달→주)/작은 실험",
+        "tagline": "실행을 돕는 질문으로 계획을 ‘정리’합니다(추천 금지)",
+        "style": "우선순위/계획 쪼개기(년→달→주)/장애물 질문",
         "method": [
-            "우선순위 정하기: 효과/중요도/난이도 기준으로 1~3개 선정",
-            "큰 목표를 계획으로 쪼개기: 년 → 달 → 주 단위로 구체화",
-            "7일 실험 1~2개 설계(15~30분 단위로 시작)",
-            "장애물/대응계획(If-Then) 정리",
-            "실행 후 리뷰 질문(무엇이 작동/방해했는가)",
+            "우선순위 정하기: 효과/중요도/난이도 기준으로 Top1~3 ‘정리’",
+            "사용자 목표를 년→달→주로 쪼개 ‘사용자가 말한 계획’을 구조화",
+            "장애물/If-Then을 ‘질문’으로 명료화",
         ],
-        "prompt_hint": "우선순위, 로드맵(년→달→주), 7일 실험, If-Then",
+        "prompt_hint": "우선순위, 로드맵(년→달→주), 장애물 질문",
     },
 ]
 
 
 # =========================
-# Pebble UI (no PIL)
+# Pebble SVG (no PIL)
 # =========================
 def _pebble_svg(fill: str, shine: str, stroke: str = "#3a3a3a") -> str:
     return f"""
@@ -138,21 +135,106 @@ def pebble_svg_b64(progress_0_to_1: float, inactive: bool = False) -> str:
     return base64.b64encode(svg.encode("utf-8")).decode("ascii")
 
 
-def render_pebble_row(current_idx: int, total: int, labels: List[str]) -> None:
-    cols = st.columns(total)
+# =========================
+# New: Pebble bridge with walker
+# =========================
+def render_pebble_bridge(current_idx: int, total: int, labels: List[str]) -> None:
+    """
+    돌멩이 다리 위를 사람이 이동하는 UI.
+    - current_idx: 현재 스텝 인덱스(0..total-1)
+    - total: 전체 스텝 수
+    """
+    total = max(2, int(total))
+    current_idx = max(0, min(int(current_idx), total - 1))
+
+    # 사람 위치를 "돌 중심" 기준으로 매핑
+    # 0% ~ 100% 구간에서, 각 돌의 중심은 (i+0.5)/total
+    left_pct = ((current_idx + 0.5) / total) * 100.0
+
+    # 돌 이미지 리스트 생성
+    pebble_imgs = []
     for i in range(total):
         active = i <= current_idx
         p = (i + 1) / total
         b64 = pebble_svg_b64(p, inactive=not active)
-        html = f"""
-        <div style="text-align:center;">
-          <img src="data:image/svg+xml;base64,{b64}" style="width:100%; max-width:140px;"/>
-          <div style="font-size:12px; margin-top:4px; opacity:{1.0 if active else 0.55};">
-            {labels[i]}
-          </div>
-        </div>
-        """
-        cols[i].markdown(html, unsafe_allow_html=True)
+        pebble_imgs.append(b64)
+
+    # HTML/CSS: 사람(🚶)이 left를 transition으로 이동
+    # Streamlit rerun 시 위치가 바뀌면서 부드럽게 이동
+    html = """
+<style>
+.pebble-bridge-wrap{
+  position: relative;
+  width: 100%;
+  margin: 6px 0 2px 0;
+  padding: 10px 4px 0 4px;
+}
+.pebble-row{
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+.pebble-cell{
+  flex: 1;
+  min-width: 0;
+  text-align: center;
+}
+.pebble-img{
+  width: 100%;
+  max-width: 120px;
+  height: auto;
+  display: inline-block;
+}
+.pebble-label{
+  font-size: 12px;
+  margin-top: 4px;
+  opacity: 0.85;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.walker{
+  position: absolute;
+  top: 0px;
+  left: VAR_LEFT%;
+  transform: translateX(-50%);
+  font-size: 26px;
+  line-height: 1;
+  transition: left 520ms cubic-bezier(.2,.9,.2,1);
+  filter: drop-shadow(0px 2px 2px rgba(0,0,0,0.25));
+  animation: bob 800ms ease-in-out infinite;
+  user-select: none;
+}
+@keyframes bob{
+  0%{ transform: translateX(-50%) translateY(0px); }
+  50%{ transform: translateX(-50%) translateY(-2px); }
+  100%{ transform: translateX(-50%) translateY(0px); }
+}
+</style>
+<div class="pebble-bridge-wrap">
+  <div class="walker">🚶</div>
+  <div class="pebble-row">
+    VAR_PEBBLES
+  </div>
+</div>
+""".strip()
+
+    pebble_cells = []
+    for i in range(total):
+        opacity = "1.0" if i <= current_idx else "0.55"
+        cell = f"""
+<div class="pebble-cell" style="opacity:{opacity}">
+  <img class="pebble-img" src="data:image/svg+xml;base64,{pebble_imgs[i]}" />
+  <div class="pebble-label">{labels[i] if i < len(labels) else ""}</div>
+</div>
+""".strip()
+        pebble_cells.append(cell)
+
+    html = html.replace("VAR_LEFT", f"{left_pct:.3f}")
+    html = html.replace("VAR_PEBBLES", "\n".join(pebble_cells))
+
+    st.markdown(html, unsafe_allow_html=True)
 
 
 def render_hero_pebble(progress: float, label: str) -> None:
@@ -187,7 +269,7 @@ def get_client(api_key: str) -> "OpenAI":
     return OpenAI(api_key=api_key)
 
 
-def call_openai_text(system: str, user: str, temperature: float = 0.7) -> Tuple[Optional[str], Optional[str], List[str]]:
+def call_openai_text(system: str, user: str, temperature: float = 0.6) -> Tuple[Optional[str], Optional[str], List[str]]:
     debug: List[str] = []
     api_key = get_api_key()
     if not api_key:
@@ -198,6 +280,7 @@ def call_openai_text(system: str, user: str, temperature: float = 0.7) -> Tuple[
     except Exception as e:
         return None, str(e), debug
 
+    # Responses API 우선
     if hasattr(client, "responses"):
         for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
             try:
@@ -225,6 +308,7 @@ def call_openai_text(system: str, user: str, temperature: float = 0.7) -> Tuple[
             except Exception as e:
                 debug.append(f"Responses failed: {type(e).__name__}: {e}")
 
+    # Chat fallback
     for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
         try:
             debug.append(f"Chat Completions / model={model}")
@@ -259,6 +343,13 @@ def init_state() -> None:
     if "coach_id" not in st.session_state:
         st.session_state.coach_id = COACHES[0]["id"]
 
+    if "situation" not in st.session_state:
+        st.session_state.situation = ""
+    if "goal" not in st.session_state:
+        st.session_state.goal = ""
+    if "options" not in st.session_state:
+        st.session_state.options = ""
+
     if "num_questions" not in st.session_state:
         st.session_state.num_questions = 5
     if "q_index" not in st.session_state:
@@ -269,10 +360,10 @@ def init_state() -> None:
     if "answers" not in st.session_state:
         st.session_state.answers = []
 
-    if "final_report_text" not in st.session_state:
-        st.session_state.final_report_text = None
     if "final_report_json" not in st.session_state:
         st.session_state.final_report_json = None
+    if "final_report_raw" not in st.session_state:
+        st.session_state.final_report_raw = None
 
     if "debug_log" not in st.session_state:
         st.session_state.debug_log = []
@@ -292,8 +383,8 @@ def reset_flow(to_page: str = "setup") -> None:
     st.session_state.q_index = 0
     st.session_state.questions = []
     st.session_state.answers = []
-    st.session_state.final_report_text = None
     st.session_state.final_report_json = None
+    st.session_state.final_report_raw = None
     st.session_state.debug_log = []
 
 
@@ -302,30 +393,8 @@ def add_answer(q: str, a: str) -> None:
 
 
 # =========================
-# Similarity + Question gen
+# Question generation
 # =========================
-def system_prompt_for(coach: Dict[str, Any]) -> str:
-    if coach["id"] == "logic":
-        return (
-            "당신은 '논리 코치'입니다. 목표는 사용자의 고민을 의사결정 문제로 구조화하는 것입니다.\n"
-            "- 쟁점/옵션/기준/제약/가정/리스크를 분리해서 다루세요.\n"
-            "- 질문은 짧고, 답변을 표/목록으로 만들기 쉬운 형태로 구성하세요.\n"
-        )
-    if coach["id"] == "value":
-        return (
-            "당신은 '가치/감정 코치'입니다. 목표는 감정과 가치관을 명료화해 사용자가 '나다운 선택'을 하도록 돕는 것입니다.\n"
-            "- 감정 라벨링 + 그 감정의 근원(욕구/두려움)을 탐색하세요.\n"
-            "- 가치(중요한 것)를 3개로 좁히고, 후회 최소화 관점 질문을 포함하세요.\n"
-        )
-    return (
-        "당신은 '실행 코치'입니다. 목표는 결정을 실행 가능한 계획과 행동으로 바꾸는 것입니다.\n"
-        "- 반드시 우선순위를 정하게 하세요(효과/중요도/난이도 기준).\n"
-        "- 큰 목표를 년→달→주 단위로 쪼개 구체화하게 하세요.\n"
-        "- 7일 실험 1~2개와 If-Then(장애물 대응)을 포함하세요.\n"
-        "- 질문은 짧고, 바로 실행할 수 있는 답을 끌어내는 형태로 구성하세요.\n"
-    )
-
-
 def normalize(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"\s+", " ", s)
@@ -357,100 +426,115 @@ def is_similar(a: str, b: str) -> bool:
     return token_overlap(a0, b0) >= 0.75
 
 
+def system_prompt_for_questions(coach: Dict[str, Any]) -> str:
+    base = (
+        "당신은 'AI 결정 코칭 앱'의 질문 생성기입니다.\n"
+        "정답/해결책/추천을 주지 말고, 사용자가 스스로 생각을 정리하도록 질문만 던지세요.\n"
+        "금지: 결론, 추천, 선택 강요, 판단문(예: A가 낫다).\n"
+        "출력: 질문 1개만. (설명/번호/머리말 금지)\n"
+    )
+    if coach["id"] == "logic":
+        return base + "스타일: 구조화/기준 분해/명료화 질문.\n"
+    if coach["id"] == "value":
+        return base + "스타일: 감정/가치/후회 최소화 관점 질문.\n"
+    return base + "스타일: 우선순위/계획(년→달→주)/장애물 질문. 단, 지시가 아니라 질문으로만 유도.\n"
+
+
 def build_context_block() -> str:
     hist = ""
     for i, qa in enumerate(st.session_state.answers[-6:], start=1):
         hist += f"{i}) Q: {qa['q']}\n   A: {qa['a']}\n"
+
+    opts = [o.strip() for o in (st.session_state.options or "").split(",") if o.strip()]
+    opts_txt = "\n".join([f"- {o}" for o in opts]) if opts else "(미입력)"
+
     return textwrap.dedent(f"""
-    [고민 카테고리] {st.session_state.category}
-    [결정 유형] {st.session_state.decision_type}
+    [세션 시작 정보]
+    - 카테고리: {st.session_state.category}
+    - 결정 유형: {st.session_state.decision_type}
+    - 상황 설명: {st.session_state.situation or "(미입력)"}
+    - 원하는 목표: {st.session_state.goal or "(미입력)"}
+    - 고려 옵션(있다면): {opts_txt}
 
     [최근 Q/A]
-    {hist if hist.strip() else "(없음)"}
+    {hist if hist.strip() else "(아직 없음)"}
     """).strip()
 
 
 def instruction_for_question(i: int, n: int, coach_id: str) -> str:
     if i == 0:
-        return "상황을 구체적으로 파악하는 질문 1개"
+        return "상황의 핵심을 더 구체화하는 질문 1개"
     if i == 1:
-        return "원하는 결과 vs 피하고 싶은 결과를 분리하는 질문 1개"
+        return "원하는 목표를 측정 가능한 형태로 정리하게 하는 질문 1개"
 
     if coach_id == "action":
         if i == 2:
-            return "해야 할 일/옵션 3~6개를 적고 효과/중요도/난이도로 우선순위 1~3개를 고르게 하는 질문 1개"
+            return "옵션/해야 할 일 3~6개를 펼치고 Top1~3 우선순위를 정리하게 하는 질문(효과/중요도/난이도 기준을 질문으로 제시)"
         if i == 3 and n >= 5:
-            return "우선순위 1개를 기준으로 목표를 년→달→주로 쪼개 계획을 세우게 하는 질문 1개"
+            return "Top1을 ‘1년→이번 달→이번 주’로 쪼개 사용자가 계획을 적게 만드는 질문 1개"
         if i < n - 2:
-            return "이번 주 7일 실험 1개 + 오늘 시작 행동(15~30분)을 구체화하는 질문 1개"
+            return "이번 주 계획을 더 구체화(무엇을/얼마나/언제)하는 질문 1개"
         if i == n - 2:
-            return "장애물 3개와 If-Then 대응을 만들게 하는 질문 1개"
-        return "실행 약속을 한 문장(언제/어디서/몇 분/무엇을)으로 고정하는 질문 1개"
-
-    if i == 2 and n >= 4:
-        return "제약(시간/돈/관계/규칙)을 명확히 하는 질문 1개"
-
-    if i < n - 2:
-        if coach_id == "logic":
-            return "옵션 2~4개와 평가 기준 3~5개를 뽑게 하는 질문 1개(표로 정리 가능)"
-        return "가치 우선순위 3개와 감정/욕구/두려움을 드러내는 질문 1개"
-
-    if i == n - 2:
-        if coach_id == "logic":
-            return "가정/리스크 검증 + 플랜B를 떠올리게 하는 질문 1개"
-        return "후회 최소화 관점(1년/5년)을 점검하는 질문 1개"
+            return "예상 장애물과 If-Then 대응을 스스로 쓰게 하는 질문 1개"
+        return "마지막으로 내 기준을 한 문장으로 정리하는 질문 1개(추천 금지)"
 
     if coach_id == "logic":
-        return "최종 확인 질문 1개(가정/리스크/대안 중 1개에 초점)"
-    return "결정 문장 한 줄을 완성하게 하는 질문 1개(나는 ___를 위해 ___을 선택한다)"
+        if i == 2 and n >= 4:
+            return "선택 기준(3~5)을 뽑게 하는 질문 1개"
+        if i < n - 2:
+            return "옵션/정보/제약을 더 분리해 명료화하는 질문 1개"
+        if i == n - 2:
+            return "불확실한 가정/추가로 확인할 정보 1~2개를 드러내는 질문 1개"
+        return "마지막으로 선택 기준 우선순위를 정리하게 하는 질문 1개(추천 금지)"
+
+    # value
+    if i == 2 and n >= 4:
+        return "지금 감정(2~3개)과 그 감정의 이유를 말하게 하는 질문 1개"
+    if i < n - 2:
+        return "가치 Top3(내게 중요한 것)와 내려놓을 것 1개를 정리하게 하는 질문 1개"
+    if i == n - 2:
+        return "후회 최소화 관점(1년/5년 후)을 점검하게 하는 질문 1개"
+    return "마지막으로 ‘내 기준’을 한 문장으로 정리하게 하는 질문 1개(추천 금지)"
 
 
 def fallback_question(coach_id: str, i: int, n: int) -> str:
     if i == 0:
-        return "지금 고민 상황을 한 문단으로 설명해 주세요. (무슨 일이 있었고, 무엇을 결정해야 하나요?)"
+        return "지금 고민 상황에서 ‘가장 핵심적인 쟁점’은 무엇인가요? (한 문장으로)"
     if i == 1:
-        return "이 결정에서 얻고 싶은 최선의 결과 1가지와 피하고 싶은 최악의 결과 1가지는 무엇인가요?"
+        return "이번 결정으로 얻고 싶은 목표를 ‘측정 가능하게’ 바꾸면 어떻게 표현할 수 있나요? (언제까지/어느 정도)"
 
     if coach_id == "action":
         if i == 2:
-            return "해야 할 일(또는 옵션)을 3~6개 적고, 그중 효과가 큰 1~3개를 우선순위로 고르면 무엇인가요?"
+            return "옵션/해야 할 일 3~6개를 적고, 효과/중요도/난이도를 생각했을 때 Top3는 무엇인가요?"
         if i == 3 and n >= 5:
-            return "우선순위 1개를 ‘1년 목표 → 이번 달 목표 → 이번 주 할 일’로 쪼개면 각각 무엇인가요?"
+            return "Top1을 기준으로 ‘1년 목표 → 이번 달 목표 → 이번 주 계획(3개)’을 적어보면 무엇인가요?"
         if i == n - 2:
-            return "이번 주 실행을 방해할 장애물 3가지를 적고, 각각 ‘만약 ~이면 → ~한다’로 대응을 만들어보면요?"
-        if i == n - 1:
-            return "이번 주 첫 행동을 ‘언제/어디서/몇 분/무엇을’ 한 문장으로 적어 주세요."
-        return "이번 주 7일 실험 1개와, 오늘 15~30분 안에 할 시작 행동은 무엇인가요?"
-
-    if i == 2 and n >= 4:
-        return "시간/돈/관계/규칙 측면에서 바꿀 수 없는 제약 2가지는 무엇인가요?"
-
-    if i == n - 1:
-        if coach_id == "logic":
-            return "확인해야 할 가장 큰 가정 1개와, 그 가정이 틀렸을 때의 플랜B는 무엇인가요?"
-        return "‘나는 ___를 위해 ___을 선택한다’ 문장을 완성하면, 빈칸에 무엇이 들어가나요?"
+            return "이번 주 계획을 방해할 장애물 3가지를 적고, 각각 ‘만약 ~이면 → ~한다’로 대응을 써볼까요?"
+        return "이 선택에서 내가 가장 중요하게 보는 기준을 한 문장으로 적어보면 무엇인가요?"
 
     if coach_id == "logic":
-        return "선택 기준 3개를 정해보면 무엇인가요? (예: 성장/비용/리스크)"
-    return "이 고민에서 가장 중요한 가치 3개는 무엇인가요? (예: 안정/성장/관계)"
+        if i == 2 and n >= 4:
+            return "이 선택을 평가할 기준 3~5개를 적어보면 무엇인가요?"
+        if i == n - 2:
+            return "지금 결정을 어렵게 만드는 ‘불확실한 정보/가정’은 무엇인가요?"
+        return "내 기준(우선순위)을 1~3위로 정리하면 무엇인가요?"
+
+    # value
+    if i == 2 and n >= 4:
+        return "지금 감정을 2~3개 단어로 적고, 각 감정이 생긴 이유를 한 줄씩 써볼까요?"
+    if i == n - 2:
+        return "1년/5년 뒤의 내가 지금의 나에게 뭐라고 말해줄 것 같나요?"
+    return "이 고민에서 가장 중요한 가치 Top3는 무엇인가요?"
 
 
 def generate_question(i: int, n: int) -> Tuple[str, Optional[str], List[str]]:
     coach = coach_by_id(st.session_state.coach_id)
-    system = system_prompt_for(coach)
+    system = system_prompt_for_questions(coach)
     prev_qs = st.session_state.questions[:]
 
     def prompt(nonce: int) -> str:
         prev_txt = "\n".join([f"- {q}" for q in prev_qs]) if prev_qs else "(없음)"
         return textwrap.dedent(f"""
-        질문 1개만 생성하세요(설명/번호 금지).
-
-        규칙:
-        - 한국어
-        - 이전 질문과 동일/유사 금지
-        - 관점이 겹치지 않게
-        - 괄호 예시 1줄 허용
-
         [이전 질문 목록]
         {prev_txt}
 
@@ -459,10 +543,14 @@ def generate_question(i: int, n: int) -> Tuple[str, Optional[str], List[str]]:
         [이번 질문 목적]
         {instruction_for_question(i, n, coach["id"])}
 
+        추가 규칙:
+        - 결론/추천/정답 금지
+        - 질문 1개만 출력
+
         (nonce={nonce})
         """).strip()
 
-    q1, err, dbg = call_openai_text(system=system, user=prompt(random.randint(1000, 9999)), temperature=0.75)
+    q1, err, dbg = call_openai_text(system=system, user=prompt(random.randint(1000, 9999)), temperature=0.7)
     if not q1:
         return fallback_question(coach["id"], i, n), err, dbg
 
@@ -491,279 +579,252 @@ def ensure_question(index: int, total: int) -> None:
 
 
 # =========================
-# Final report JSON generation + rendering
+# Final report JSON (요약/기준/코칭 메시지, 추천 금지)
 # =========================
-def json_schema_hint(coach_id: str) -> str:
-    # 모델이 반환할 JSON 형태를 강하게 고정(시각화에 쓰기 위함)
+def report_schema_hint(coach_id: str) -> str:
+    base = """
+반드시 JSON만 출력하세요(코드블록/설명 금지).
+반드시 '추천/결론/정답'을 내리지 마세요.
+대신 사용자가 말한 내용을 "요약/정리/기준화"하고, 마지막에 '다음에 스스로에게 던질 1개 질문'을 포함하세요.
+"""
     if coach_id == "action":
-        return textwrap.dedent("""
-        반드시 JSON만 출력하세요. (코드블록 금지)
-
-        JSON 스키마:
-        {
-          "one_line_summary": "string",
-          "priorities": [
-            {"item":"string","reason":"string","impact":1-5,"difficulty":1-5}
-          ],
-          "roadmap": {
-            "year_goal": "string",
-            "month_goal": "string",
-            "week_plan": ["string","string","string"]
-          },
-          "weekly_calendar": {
-            "Mon": ["task","task"],
-            "Tue": [],
-            "Wed": [],
-            "Thu": [],
-            "Fri": [],
-            "Sat": [],
-            "Sun": []
-          },
-          "experiments": [
-            {"name":"string","steps":["string","string"],"start_action":"string"}
-          ],
-          "if_then": [
-            {"if":"string","then":"string"}
-          ],
-          "today_checklist": ["string","string"],
-          "review_questions": ["string","string"],
-          "extra_check_question": "string"
-        }
-        """).strip()
+        return textwrap.dedent(
+            base
+            + """
+JSON 스키마:
+{
+  "summary": {
+    "core_issue": "string",
+    "goal": "string",
+    "constraints": ["string"],
+    "options_mentioned": ["string"]
+  },
+  "criteria": [
+    {"name":"string","priority":1-5,"why":"string"}
+  ],
+  "plan_visualization": {
+    "year": "string",
+    "month": "string",
+    "week": ["string","string","string"]
+  },
+  "weekly_table": {
+    "Mon": ["string"], "Tue": ["string"], "Wed": ["string"], "Thu": ["string"],
+    "Fri": ["string"], "Sat": ["string"], "Sun": ["string"]
+  },
+  "coaching_message": ["string","string"],
+  "next_self_question": "string"
+}
+"""
+        ).strip()
 
     if coach_id == "logic":
-        return textwrap.dedent("""
-        반드시 JSON만 출력하세요. (코드블록 금지)
+        return textwrap.dedent(
+            base
+            + """
+JSON 스키마:
+{
+  "summary": {
+    "core_issue":"string",
+    "goal":"string",
+    "constraints":["string"],
+    "options_mentioned":["string"]
+  },
+  "criteria": [{"name":"string","priority":1-5,"why":"string"}],
+  "key_points": {"uncertainties":["string"], "tradeoffs":["string"]},
+  "coaching_message":["string","string"],
+  "next_self_question":"string"
+}
+"""
+        ).strip()
 
-        JSON 스키마:
-        {
-          "one_line_conclusion": "string",
-          "issue": "string",
-          "options": ["string","string"],
-          "criteria": ["string","string","string"],
-          "constraints_assumptions": ["string"],
-          "risks_mitigations": [{"risk":"string","mitigation":"string"}],
-          "recommendation": {"pick":"string","reasons":["string","string","string"],"next_24h":["string"]},
-          "extra_check_question":"string"
-        }
-        """).strip()
-
-    return textwrap.dedent("""
-    반드시 JSON만 출력하세요. (코드블록 금지)
-
-    JSON 스키마:
-    {
-      "now_feelings": {"emotions":["string","string"],"core_need_or_fear":"string"},
-      "top_values": ["string","string","string"],
-      "decision_sentence": "string",
-      "regret_check": {"one_year":"string","five_years":"string"},
-      "tomorrow_promise": ["string","string"],
-      "extra_check_question":"string"
-    }
-    """).strip()
+    return textwrap.dedent(
+        base
+        + """
+JSON 스키마:
+{
+  "summary": {
+    "core_issue":"string",
+    "goal":"string",
+    "constraints":["string"],
+    "options_mentioned":["string"]
+  },
+  "criteria": [{"name":"string","priority":1-5,"why":"string"}],
+  "emotions_values": {"emotions":["string","string"], "top_values":["string","string","string"]},
+  "coaching_message":["string","string"],
+  "next_self_question":"string"
+}
+"""
+    ).strip()
 
 
 def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
     if not text:
         return None
     t = text.strip()
-
-    # 만약 모델이 실수로 앞뒤 텍스트를 붙였을 경우를 대비해 JSON만 추출
-    # 가장 바깥 { ... } 범위를 찾는 단순 방식
     if not t.startswith("{"):
         m = re.search(r"\{.*\}", t, flags=re.S)
         if m:
             t = m.group(0).strip()
-
     try:
         return json.loads(t)
     except Exception:
         return None
 
 
-def generate_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str], List[str], Optional[str]]:
+def system_prompt_for_report(_: Dict[str, Any]) -> str:
+    return (
+        "당신은 'AI 결정 코칭 앱'의 최종 요약 생성기입니다.\n"
+        "절대 정답/결론/추천을 제시하지 마세요.\n"
+        "사용자의 답변을 기반으로 '고민의 핵심, 선택 기준, 코칭 메시지'를 정리해 주세요.\n"
+        "출력은 반드시 JSON만.\n"
+    )
+
+
+def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str], List[str], Optional[str]]:
     coach = coach_by_id(st.session_state.coach_id)
-    system = system_prompt_for(coach)
+    system = system_prompt_for_report(coach)
 
     qa_text = ""
     for i, qa in enumerate(st.session_state.answers, start=1):
         qa_text += f"{i}) Q: {qa['q']}\n   A: {qa['a']}\n"
 
+    opts = [o.strip() for o in (st.session_state.options or "").split(",") if o.strip()]
+
     user = textwrap.dedent(f"""
-    사용자의 답변을 바탕으로 최종 리포트를 작성하세요.
+{report_schema_hint(coach["id"])}
 
-    목표:
-    - 사용자의 답변을 반영해 맞춤형 계획/정리 제공
-    - 실행 코치라면 반드시 계획을 시각화 가능한 구조(우선순위/로드맵/주간 캘린더)로 만들기
-    - 논리/가치 코치도 구조화된 핵심을 담기
+[세션 시작 정보]
+- 카테고리: {st.session_state.category}
+- 결정 유형: {st.session_state.decision_type}
+- 상황 설명: {st.session_state.situation}
+- 원하는 목표: {st.session_state.goal}
+- 옵션(있다면): {opts if opts else "(없음)"}
 
-    규칙:
-    - {json_schema_hint(coach["id"])}
+[Q/A]
+{qa_text}
 
-    [설정]
-    - 카테고리: {st.session_state.category}
-    - 결정 유형: {st.session_state.decision_type}
-    - 코치: {coach["name"]}
+중요:
+- 추천/결론/정답 금지
+- 사용자가 말한 계획/의도/기준을 "정리"만 하기
+- 사용자가 계획을 거의 말하지 않았다면 plan_visualization/weekly_table은 과장하지 말고, 말한 범위에서만 작성
+""").strip()
 
-    [Q/A]
-    {qa_text}
-    """).strip()
-
-    text, err, dbg = call_openai_text(system=system, user=user, temperature=0.4)
+    text, err, dbg = call_openai_text(system=system, user=user, temperature=0.35)
     if not text:
         return None, err, dbg, None
 
     data = safe_json_parse(text)
     if data is None:
-        # 파싱 실패 시: 텍스트를 그대로 보관
-        return None, "리포트 JSON 파싱에 실패했습니다. (모델이 JSON만 출력하지 않았을 수 있어요)", dbg, text
+        return None, "리포트 JSON 파싱 실패(모델이 JSON만 출력하지 않았을 수 있음)", dbg, text
 
     return data, None, dbg, text
 
 
-def render_action_report(data: Dict[str, Any]) -> None:
-    st.subheader("한 줄 요약")
-    st.write(data.get("one_line_summary", ""))
-
-    st.subheader("우선순위 Top")
-    pr = data.get("priorities", []) or []
-    if pr:
-        rows = []
-        for p in pr:
-            rows.append(
-                {
-                    "항목": p.get("item", ""),
-                    "이유": p.get("reason", ""),
-                    "임팩트(1~5)": p.get("impact", ""),
-                    "난이도(1~5)": p.get("difficulty", ""),
-                }
-            )
-        st.dataframe(rows, use_container_width=True)
-        # 임팩트/난이도 바 차트(간단)
-        chart_rows = [{"label": r["항목"], "impact": r["임팩트(1~5)"], "difficulty": r["난이도(1~5)"]} for r in rows]
-        st.bar_chart(chart_rows, x="label", y=["impact", "difficulty"])
-    else:
-        st.caption("우선순위 데이터가 없습니다.")
-
-    st.subheader("로드맵 (년 → 달 → 주)")
-    roadmap = data.get("roadmap", {}) or {}
-    c1, c2, c3 = st.columns(3)
-    c1.metric("1년 목표", roadmap.get("year_goal", "-"))
-    c2.metric("이번 달 목표", roadmap.get("month_goal", "-"))
-    c3.metric("이번 주 핵심", "3~5개")
-
-    week_plan = roadmap.get("week_plan", []) or []
-    if week_plan:
-        st.write("이번 주 계획:")
-        for w in week_plan:
-            st.write(f"- {w}")
-
-    st.subheader("이번 주 캘린더(간단)")
-    cal = data.get("weekly_calendar", {}) or {}
-    # 요일 순서 고정
-    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-    table = []
-    for d in days:
-        table.append({"Day": d, "Tasks": "\n".join(cal.get(d, []) or [])})
-    st.dataframe(table, use_container_width=True, hide_index=True)
-
-    st.subheader("7일 실험")
-    exps = data.get("experiments", []) or []
-    if exps:
-        for i, e in enumerate(exps, start=1):
-            with st.container(border=True):
-                st.markdown(f"**실험 {i}: {e.get('name','')}**")
-                st.write("Steps:")
-                for s in e.get("steps", []) or []:
-                    st.write(f"- {s}")
-                st.write(f"시작 행동: {e.get('start_action','')}")
-    else:
-        st.caption("실험 데이터가 없습니다.")
-
-    st.subheader("If-Then 대응표")
-    it = data.get("if_then", []) or []
-    if it:
-        st.dataframe([{"If": x.get("if", ""), "Then": x.get("then", "")} for x in it], use_container_width=True, hide_index=True)
-    else:
-        st.caption("If-Then 데이터가 없습니다.")
-
-    st.subheader("오늘 체크리스트(24시간)")
-    for t in data.get("today_checklist", []) or []:
-        st.checkbox(t, value=False)
-
-    st.subheader("리뷰 질문")
-    for q in data.get("review_questions", []) or []:
-        st.write(f"- {q}")
-
-    st.divider()
-    st.write(f"추가 확인 질문: **{data.get('extra_check_question','')}**")
-
-
-def render_logic_report(data: Dict[str, Any]) -> None:
-    st.subheader("한 줄 결론")
-    st.write(data.get("one_line_conclusion", ""))
-
-    st.subheader("의사결정 구조")
-    st.write(f"쟁점: {data.get('issue','')}")
+# =========================
+# Render report
+# =========================
+def render_summary_block(data: Dict[str, Any]) -> None:
+    s = data.get("summary", {}) or {}
+    st.subheader("고민의 핵심 요약")
     c1, c2 = st.columns(2)
     with c1:
-        st.write("옵션")
-        for x in data.get("options", []) or []:
+        st.write(f"**핵심 고민:** {s.get('core_issue','')}")
+        st.write(f"**목표:** {s.get('goal','')}")
+    with c2:
+        cons = s.get("constraints", []) or []
+        opts = s.get("options_mentioned", []) or []
+        st.write("**제약/조건:**")
+        if cons:
+            for x in cons:
+                st.write(f"- {x}")
+        else:
+            st.caption("제약이 명확히 언급되지 않았어요.")
+        st.write("**언급된 옵션:**")
+        if opts:
+            for x in opts:
+                st.write(f"- {x}")
+        else:
+            st.caption("옵션이 명확히 언급되지 않았어요.")
+
+
+def render_criteria(data: Dict[str, Any]) -> None:
+    st.subheader("선택 기준 정리(우선순위 포함)")
+    crit = data.get("criteria", []) or []
+    if not crit:
+        st.caption("선택 기준이 충분히 드러나지 않았어요. 다음 질문을 참고해 보세요.")
+        return
+    rows = []
+    for c in crit:
+        rows.append(
+            {
+                "기준": c.get("name", ""),
+                "우선순위(1~5)": c.get("priority", ""),
+                "왜 중요한가": c.get("why", ""),
+            }
+        )
+    st.dataframe(rows, use_container_width=True, hide_index=True)
+
+
+def render_action_visualization(data: Dict[str, Any]) -> None:
+    st.subheader("계획 정리(년 → 달 → 주) — 사용자 답변 기반")
+    pv = data.get("plan_visualization", {}) or {}
+    c1, c2, c3 = st.columns(3)
+    c1.metric("년", pv.get("year", "") or "-")
+    c2.metric("달", pv.get("month", "") or "-")
+    c3.metric("주(핵심 3개)", " ")
+
+    week = pv.get("week", []) or []
+    if week:
+        for x in week:
+            st.write(f"- {x}")
+    else:
+        st.caption("사용자 답변에서 주 단위 계획이 충분히 드러나지 않았어요.")
+
+    st.subheader("주간 테이블(정리용)")
+    cal = data.get("weekly_table", {}) or {}
+    days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+    table = [{"Day": d, "Tasks": "\n".join(cal.get(d, []) or [])} for d in days]
+    st.dataframe(table, use_container_width=True, hide_index=True)
+
+
+def render_key_points_logic(data: Dict[str, Any]) -> None:
+    kp = data.get("key_points", {}) or {}
+    st.subheader("정리 포인트")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("**불확실한 부분(추가 확인이 필요한 것)**")
+        for x in kp.get("uncertainties", []) or []:
             st.write(f"- {x}")
     with c2:
-        st.write("기준")
-        for x in data.get("criteria", []) or []:
+        st.write("**트레이드오프(얻는 것 vs 잃는 것)**")
+        for x in kp.get("tradeoffs", []) or []:
             st.write(f"- {x}")
 
-    st.subheader("제약/가정")
-    for x in data.get("constraints_assumptions", []) or []:
-        st.write(f"- {x}")
 
-    st.subheader("리스크/대응")
-    rms = data.get("risks_mitigations", []) or []
-    if rms:
-        st.dataframe([{"Risk": r.get("risk", ""), "Mitigation": r.get("mitigation", "")} for r in rms], use_container_width=True, hide_index=True)
-
-    st.subheader("추천안")
-    rec = data.get("recommendation", {}) or {}
-    st.write(f"추천: **{rec.get('pick','')}**")
-    st.write("이유:")
-    for x in rec.get("reasons", []) or []:
-        st.write(f"- {x}")
-    st.write("다음 24시간:")
-    for x in rec.get("next_24h", []) or []:
-        st.write(f"- {x}")
-
-    st.divider()
-    st.write(f"추가 확인 질문: **{data.get('extra_check_question','')}**")
+def render_emotions_values(data: Dict[str, Any]) -> None:
+    ev = data.get("emotions_values", {}) or {}
+    st.subheader("감정/가치 정리")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("**감정**")
+        for x in ev.get("emotions", []) or []:
+            st.write(f"- {x}")
+    with c2:
+        st.write("**가치 Top3**")
+        for x in ev.get("top_values", []) or []:
+            st.write(f"- {x}")
 
 
-def render_value_report(data: Dict[str, Any]) -> None:
-    st.subheader("지금의 마음")
-    nf = data.get("now_feelings", {}) or {}
-    st.write("감정:")
-    for x in nf.get("emotions", []) or []:
-        st.write(f"- {x}")
-    st.write(f"핵심 욕구/두려움: {nf.get('core_need_or_fear','')}")
+def render_coaching_message(data: Dict[str, Any]) -> None:
+    st.subheader("코칭 메시지(정답/추천 없이 정리)")
+    msgs = data.get("coaching_message", []) or []
+    for m in msgs:
+        st.write(f"- {m}")
 
-    st.subheader("가치 우선순위 Top3")
-    for x in data.get("top_values", []) or []:
-        st.write(f"- {x}")
 
-    st.subheader("나다운 선택 문장")
-    st.write(data.get("decision_sentence", ""))
-
-    st.subheader("후회 최소화 체크")
-    rc = data.get("regret_check", {}) or {}
-    st.write(f"- 1년 뒤의 나: {rc.get('one_year','')}")
-    st.write(f"- 5년 뒤의 나: {rc.get('five_years','')}")
-
-    st.subheader("내일의 작은 약속")
-    for x in data.get("tomorrow_promise", []) or []:
-        st.write(f"- {x}")
-
-    st.divider()
-    st.write(f"추가 확인 질문: **{data.get('extra_check_question','')}**")
+def render_next_question(data: Dict[str, Any]) -> None:
+    st.subheader("다음에 스스로에게 던질 질문(1개)")
+    st.write(f"**{data.get('next_self_question','')}**")
 
 
 # =========================
@@ -771,15 +832,17 @@ def render_value_report(data: Dict[str, Any]) -> None:
 # =========================
 init_state()
 
-# Sidebar
 with st.sidebar:
     st.header("설정")
     st.text_input("OpenAI API Key (Secrets 우선)", type="password", key="openai_api_key_input")
 
     st.divider()
-    st.subheader("고민 범위")
-    st.selectbox("고민 카테고리", [x[0] for x in TOPIC_CATEGORIES], key="category")
+    st.subheader("상황 설정(세션 시작)")
+    st.selectbox("카테고리", [x[0] for x in TOPIC_CATEGORIES], key="category")
     st.selectbox("결정 유형", DECISION_TYPES, key="decision_type")
+    st.text_area("상황 설명", key="situation", height=90, placeholder="무슨 일이 있었고 무엇을 결정해야 하나요?")
+    st.text_input("원하는 목표", key="goal", placeholder="이 결정에서 얻고 싶은 결과(가능하면 측정 가능하게)")
+    st.text_input("옵션(쉼표로 구분, 선택)", key="options", placeholder="예: A, B, C")
 
     st.divider()
     st.subheader("코치 선택")
@@ -787,7 +850,6 @@ with st.sidebar:
     cur = next((i for i, c in enumerate(COACHES) if c["id"] == st.session_state.coach_id), 0)
     picked = st.radio("코치", coach_labels, index=cur)
     st.session_state.coach_id = COACHES[coach_labels.index(picked)]["id"]
-
     coach = coach_by_id(st.session_state.coach_id)
     with st.expander("코치 진행 방식"):
         st.markdown(f"**{coach['name']}**  \n_{coach['style']}_")
@@ -812,7 +874,7 @@ with st.sidebar:
                 st.rerun()
         elif st.session_state.page == "questions":
             done = len(st.session_state.answers) >= int(st.session_state.num_questions)
-            if st.button("최종 레포트로", use_container_width=True, disabled=not done):
+            if st.button("최종 결과로", use_container_width=True, disabled=not done):
                 st.session_state.page = "report"
                 st.rerun()
         else:
@@ -820,9 +882,9 @@ with st.sidebar:
                 st.session_state.page = "questions"
                 st.rerun()
 
-# Progress
+# Progress (돌다리 + 사람)
 nq = int(st.session_state.num_questions)
-labels = ["설정"] + [f"Q{i}" for i in range(1, nq + 1)] + ["레포트"]
+labels = ["설정"] + [f"Q{i}" for i in range(1, nq + 1)] + ["요약"]
 if st.session_state.page == "setup":
     idx = 0
 elif st.session_state.page == "questions":
@@ -830,35 +892,37 @@ elif st.session_state.page == "questions":
 else:
     idx = 1 + nq
 
-render_pebble_row(idx, len(labels), labels)
+render_pebble_bridge(idx, len(labels), labels)
+
 progress = idx / max(1, (len(labels) - 1))
 with st.columns([1, 2, 1])[1]:
     render_hero_pebble(progress, f"진행도: {int(progress*100)}%")
 
 st.divider()
 
-# Page: setup
 coach = coach_by_id(st.session_state.coach_id)
+
 if st.session_state.page == "setup":
-    st.title("🪨 돌멩이 결정 코치")
-    st.caption("질문에 답하면 자동으로 다음 질문으로 이동하고, 끝나면 맞춤형 최종 리포트를 시각화해서 보여줍니다.")
+    st.title("🪨 AI 결정 코칭")
+    st.caption("정답을 주기보다, 질문으로 생각을 정리하도록 돕습니다. 한 화면에 한 질문씩 진행됩니다.")
+    st.info("사이드바에서 상황을 입력하고 ‘질문 시작’을 누르세요.")
 
-    cat_desc = next((d for n, d in TOPIC_CATEGORIES if n == st.session_state.category), "")
-    st.info(f"**카테고리:** {st.session_state.category}\n\n{cat_desc}")
-    st.write(f"**결정 유형:** {st.session_state.decision_type}")
-    st.write(f"**코치:** {coach['name']}")
-    st.write(f"**질문 개수:** {nq}개")
-    st.success("사이드바에서 ‘질문 시작’을 누르세요.")
+    with st.container(border=True):
+        st.subheader("현재 설정 미리보기")
+        st.write(f"- 카테고리: {st.session_state.category}")
+        st.write(f"- 결정 유형: {st.session_state.decision_type}")
+        st.write(f"- 코치: {coach['name']}")
+        st.write(f"- 질문 개수: {nq}")
+        st.write(f"- 상황 설명: {st.session_state.situation or '(미입력)'}")
+        st.write(f"- 목표: {st.session_state.goal or '(미입력)'}")
+        st.write(f"- 옵션: {st.session_state.options or '(미입력)'}")
 
-# Page: questions
 elif st.session_state.page == "questions":
     st.title("질문")
-    st.caption("답변을 저장하면 다음 질문으로 이동합니다. 모든 질문을 끝내면 레포트 페이지로 넘어갑니다.")
+    st.caption("한 화면에 한 질문. 답변을 저장하면 다음 질문으로 이동합니다.")
 
     q_idx = int(st.session_state.q_index)
-    if q_idx >= nq:
-        st.session_state.q_index = nq - 1
-        q_idx = nq - 1
+    q_idx = max(0, min(q_idx, nq - 1))
 
     ensure_question(q_idx, nq)
     q = st.session_state.questions[q_idx]
@@ -872,7 +936,7 @@ elif st.session_state.page == "questions":
         if st.session_state.answers:
             last_a = st.session_state.answers[-1]["a"]
             hint = f"이전 답 요약: {last_a[:90]}{'…' if len(last_a) > 90 else ''}"
-        ans = st.text_area("답변", placeholder=hint or "여기에 답변을 입력하세요", height=140)
+        ans = st.text_area("답변", placeholder=hint or "여기에 답변을 입력하세요", height=150)
         submitted = st.form_submit_button("답변 저장", use_container_width=True)
 
     if submitted:
@@ -887,7 +951,7 @@ elif st.session_state.page == "questions":
                 st.session_state.q_index += 1
             st.rerun()
 
-    with st.expander("답변 기록 보기"):
+    with st.expander("답변 기록"):
         for i, qa in enumerate(st.session_state.answers, start=1):
             st.markdown(f"**Q{i}. {qa['q']}**")
             st.write(qa["a"])
@@ -897,10 +961,9 @@ elif st.session_state.page == "questions":
     with st.expander("디버그 로그"):
         st.write(st.session_state.debug_log)
 
-# Page: report
 else:
-    st.title("최종 리포트 (맞춤형)")
-    st.caption("사용자의 답변을 바탕으로 구조화된 리포트를 만들고, 그 데이터를 시각화해 보여줍니다.")
+    st.title("최종 정리")
+    st.caption("정답/추천 없이, 고민의 핵심과 기준을 정리해 줍니다(사용자 답변 기반).")
 
     if len(st.session_state.answers) < nq:
         st.warning("아직 모든 질문이 완료되지 않았습니다. 질문 페이지로 돌아가 답변을 완료하세요.")
@@ -911,44 +974,46 @@ else:
 
     colA, colB = st.columns([1, 1])
     with colA:
-        gen = st.button("리포트 생성/새로고침", type="primary", use_container_width=True)
+        gen = st.button("정리 생성/새로고침", type="primary", use_container_width=True)
     with colB:
-        if st.button("새 고민 시작", use_container_width=True):
+        if st.button("새 세션 시작", use_container_width=True):
             reset_flow("setup")
             st.rerun()
 
-    if gen or (st.session_state.final_report_json is None and st.session_state.final_report_text is None):
-        with st.spinner("맞춤형 리포트를 생성하는 중..."):
-            data, err, dbg, raw_text = generate_report_json()
+    if gen or (st.session_state.final_report_json is None and st.session_state.final_report_raw is None):
+        with st.spinner("최종 정리를 생성하는 중..."):
+            data, err, dbg, raw = generate_final_report_json()
             st.session_state.debug_log = dbg
             if data is not None:
                 st.session_state.final_report_json = data
-                st.session_state.final_report_text = None
+                st.session_state.final_report_raw = raw
             else:
-                # 파싱 실패 시 raw_text를 보여주기(디버깅)
                 st.session_state.final_report_json = None
-                st.session_state.final_report_text = raw_text
-                st.error(err or "리포트 생성 실패")
+                st.session_state.final_report_raw = raw
+                st.error(err or "정리 생성 실패")
 
-    coach_id = coach_by_id(st.session_state.coach_id)["id"]
+    data = st.session_state.final_report_json
+    if data:
+        st.success("최종 정리가 준비되었습니다.")
+        render_summary_block(data)
+        render_criteria(data)
 
-    if st.session_state.final_report_json:
-        data = st.session_state.final_report_json
-        st.success("맞춤형 리포트가 준비되었습니다.")
-
-        if coach_id == "action":
-            render_action_report(data)
-        elif coach_id == "logic":
-            render_logic_report(data)
+        if coach["id"] == "action":
+            render_action_visualization(data)
+        elif coach["id"] == "logic":
+            render_key_points_logic(data)
         else:
-            render_value_report(data)
+            render_emotions_values(data)
+
+        render_coaching_message(data)
+        render_next_question(data)
 
         st.subheader("공유용(JSON)")
         st.code(json.dumps(data, ensure_ascii=False, indent=2), language="json")
 
-    elif st.session_state.final_report_text:
-        st.warning("JSON 파싱 실패로 텍스트 리포트 원문을 표시합니다(모델 출력이 JSON만이 아닐 수 있음).")
-        st.code(st.session_state.final_report_text, language="text")
+    elif st.session_state.final_report_raw:
+        st.warning("JSON 파싱 실패로 원문을 표시합니다.")
+        st.code(st.session_state.final_report_raw, language="text")
 
     with st.expander("Q/A 전체 보기"):
         for i, qa in enumerate(st.session_state.answers, start=1):
