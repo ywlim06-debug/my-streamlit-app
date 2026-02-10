@@ -2,25 +2,31 @@
 # ─────────────────────────────────────────────────────────────
 # 🪨 돌멩이 AI 결정 코칭 (Pebble Decision Coach)
 #
-# PRD/계획서 준수:
+# 원칙(유지):
 # - 정답/결론/추천 제공 금지 (강제)
 # - 한 화면에 한 질문씩
 # - 이전 답변 반영 동적 질문 생성
 # - 마지막: 고민의 핵심 / 선택 기준 / 코칭 메시지(거울 비추기, 추천 금지)
 #
-# 반영된 개선사항:
-# 1) 구조 코치: "가정 깨기(역발상/반대 가정)" 고정 질문 포함
-# 2) 가치 코치: "감정 vs 가치 분리" 고정 질문 포함
-# 3) 실행 코치: 마지막에 "오늘 5분 Quick Win" 고정 질문 포함
-# 4) Dynamic Depth: 답변이 너무 짧으면 Probe 질문 1회 추가(다음 단계로 안 넘어감)
-# 5) 리포트: 추천/지시 표현 방지 강화 + 위반 시 자동 재생성 1회
+# 이번 고도화 반영:
+# 1) 질문 생성 고도화
+#   - Logic Cross-Check(답변 간 논리 충돌 감지 → 충돌을 짚는 질문 우선 생성)
+#   - Probing(답변 10자 미만이면 1회 구체화 질문)
+#   - Action Coach 강화: If-Then 트리거 + Pre-mortem 질문 포함
 #
-# UI:
-# - 돌다리 진행 UI + 사람(🚶) 아이콘 크게(40px) + 방향 반대
-# - PIL 미사용 (SVG base64 HTML 렌더)
+# 2) UI/UX
+#   - 이전으로(Back) 버튼: q_index 감소 + answers 마지막 답변 제거(+probe 상태 정리)
+#   - 결정 유형별 템플릿: 결정 유형 선택 시 상황 설명에 가이드 자동 입력(상황이 비어있거나 가이드 문구일 때)
+#   - 리포트 진입 시 st.balloons()
+#
+# 3) 리포트/공유
+#   - 의사결정 매트릭스(st.data_editor): 옵션 x 기준 점수(1~5)
+#   - 내면의 목소리(Mirroring): 답변 키워드/감정어 빈도 시각 요약
+#   - 저장: 클립보드 복사 버튼 + 타임스탬프 파일명 .txt 다운로드
+#   - 결정 유효기간: 오늘로부터 7일 뒤까지
 #
 # 필요:
-#   pip install streamlit openai
+#   pip install streamlit openai pandas
 # ─────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -30,9 +36,10 @@ import json
 import random
 import re
 import textwrap
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+import pandas as pd
 import streamlit as st
 
 try:
@@ -66,6 +73,54 @@ DECISION_TYPES = [
     "갈등 해결/대화 방향",
 ]
 
+DECISION_TEMPLATES: Dict[str, str] = {
+    "A vs B 선택(둘 중 하나)": textwrap.dedent(
+        """\
+        [가이드] A vs B 선택 정리
+        1) A와 B를 한 문장으로 정의해보세요(무엇이 다른가?)
+        2) A의 장점/단점, B의 장점/단점을 각각 2~3개씩 적어보세요
+        3) '내게 중요한 기준' 3개를 적고, 각 기준에서 A/B가 어떻게 다른지 써보세요
+        4) 최악의 경우(리스크)와 감당 가능한 정도를 적어보세요
+        """
+    ).strip(),
+    "여러 옵션 중 선택": textwrap.dedent(
+        """\
+        [가이드] 여러 옵션 비교
+        1) 후보 옵션을 모두 나열해보세요(최소 3개)
+        2) 비교 기준 3~5개(비용/시간/성장/스트레스/관계 등)를 적어보세요
+        3) 각 옵션이 기준별로 어떤 느낌인지(좋음/보통/나쁨)부터 대략 적어보세요
+        4) '지금의 나'에게 중요한 것과 '1년 뒤의 나'에게 중요한 것을 구분해보세요
+        """
+    ).strip(),
+    "해야 할지 말지(Yes/No)": textwrap.dedent(
+        """\
+        [가이드] 해야 할지 말지(Yes/No)
+        1) '한다'의 의미를 구체화(무엇을/얼마나/어떤 수준으로?)
+        2) 한다면 얻는 것/잃는 것, 안 한다면 얻는 것/잃는 것을 각각 적어보세요
+        3) 결정이 미뤄질 때 생기는 비용(불안/기회/관계 등)을 적어보세요
+        4) 지금 당장 필요한 추가 정보 1~2개가 무엇인지 적어보세요
+        """
+    ).strip(),
+    "언제/어떻게 할지(전략/시점)": textwrap.dedent(
+        """\
+        [가이드] 전략/시점 결정
+        1) 성공의 정의를 한 문장으로(측정 가능하게)
+        2) 선택 가능한 시나리오 2~3개(빠르게/천천히/부분 적용 등) 나열
+        3) 각 시나리오의 리스크와 완충장치(보험)를 적어보세요
+        4) '시작 트리거(If) → 행동(Then)' 형태로 실행 조건을 설계해보세요
+        """
+    ).strip(),
+    "갈등 해결/대화 방향": textwrap.dedent(
+        """\
+        [가이드] 갈등/대화 방향 정리
+        1) 지금 갈등의 쟁점을 '사실/해석/감정/요구'로 나눠 적어보세요
+        2) 내가 원하는 변화(요구) 1~2개를 구체적으로 적어보세요
+        3) 상대가 중요하게 여길 만한 것을 추측해 적어보세요(확정 아님)
+        4) 대화에서 지키고 싶은 원칙(톤/타이밍/한계선)을 적어보세요
+        """
+    ).strip(),
+}
+
 COACHES = [
     {
         "id": "logic",
@@ -95,18 +150,19 @@ COACHES = [
         "id": "action",
         "name": "⚔️ 실행 코치",
         "tagline": "계획을 ‘정리’하고, 오늘 5분 Quick Win까지 스스로 찾게 돕습니다(추천 금지)",
-        "style": "우선순위/년→달→주/장애물/Quick Win",
+        "style": "우선순위/If-Then/프리모템/Quick Win",
         "method": [
             "우선순위 정하기: 효과/중요도/난이도 기준으로 Top1~3 정리",
-            "목표를 년→달→주로 쪼개 ‘사용자가 말한 계획’을 구조화",
+            "실행을 ‘언제’가 아니라 ‘If-Then 트리거’로 설계",
+            "실패를 미리 가정(프리모템)해 방해 요인을 드러내기",
             "마지막에 ‘오늘 5분 안에 할 수 있는 가장 작은 행동’ 도출",
         ],
-        "prompt_hint": "우선순위, 로드맵(년→달→주), If-Then, Quick Win",
+        "prompt_hint": "우선순위, If-Then, 프리모템, Quick Win",
     },
 ]
 
-# 답변이 짧다고 판단하는 기준
-MIN_ANSWER_CHARS = 18
+# Probing 기준: "10자 미만"이면 1회 추가 질문 (요구사항 반영)
+MIN_ANSWER_CHARS = 10
 SHORT_ANSWER_PATTERNS = [
     r"^모르겠",
     r"^잘\s*모르",
@@ -287,6 +343,7 @@ def call_openai_text(system: str, user: str, temperature: float = 0.6) -> Tuple[
     except Exception as e:
         return None, str(e), debug
 
+    # Responses API 우선
     if hasattr(client, "responses"):
         for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
             try:
@@ -314,6 +371,7 @@ def call_openai_text(system: str, user: str, temperature: float = 0.6) -> Tuple[
             except Exception as e:
                 debug.append(f"Responses failed: {type(e).__name__}: {e}")
 
+    # Chat Completions fallback
     for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
         try:
             debug.append(f"Chat Completions / model={model}")
@@ -378,15 +436,31 @@ def init_state() -> None:
     if "probe_for_index" not in st.session_state:
         st.session_state.probe_for_index = None  # type: ignore
 
+    # logic cross-check(충돌 질문) 생성 여부: main_index별 1회
+    if "crosscheck_used_for" not in st.session_state:
+        st.session_state.crosscheck_used_for = set()  # type: ignore
+
     if "final_report_json" not in st.session_state:
         st.session_state.final_report_json = None
     if "final_report_raw" not in st.session_state:
         st.session_state.final_report_raw = None
 
+    # 리포트 진입 효과
+    if "report_just_entered" not in st.session_state:
+        st.session_state.report_just_entered = False
+
+    # 의사결정 매트릭스 상태
+    if "decision_matrix_df" not in st.session_state:
+        st.session_state.decision_matrix_df = None
+
     if "debug_log" not in st.session_state:
         st.session_state.debug_log = []
     if "openai_api_key_input" not in st.session_state:
         st.session_state.openai_api_key_input = ""
+
+    # 결정 유형 템플릿 자동 입력을 위한 last 기억
+    if "last_decision_type" not in st.session_state:
+        st.session_state.last_decision_type = st.session_state.decision_type
 
 
 def coach_by_id(coach_id: str) -> Dict[str, Any]:
@@ -404,8 +478,11 @@ def reset_flow(to_page: str = "setup") -> None:
     st.session_state.probe_active = False
     st.session_state.probe_question = ""
     st.session_state.probe_for_index = None
+    st.session_state.crosscheck_used_for = set()
     st.session_state.final_report_json = None
     st.session_state.final_report_raw = None
+    st.session_state.decision_matrix_df = None
+    st.session_state.report_just_entered = False
     st.session_state.debug_log = []
 
 
@@ -463,6 +540,10 @@ def is_too_short_answer(ans: str) -> bool:
     return False
 
 
+def parse_options() -> List[str]:
+    return [o.strip() for o in (st.session_state.options or "").split(",") if o.strip()]
+
+
 # =========================
 # Question generation
 # =========================
@@ -477,7 +558,7 @@ def system_prompt_for_questions(coach: Dict[str, Any]) -> str:
         return base + "스타일: 구조화/기준/역발상(가정 깨기) 질문.\n"
     if coach["id"] == "value":
         return base + "스타일: 감정 라벨링 + 감정/가치 분리 + 후회 최소화 질문.\n"
-    return base + "스타일: 우선순위/계획(년→달→주)/장애물/Quick Win을 모두 질문으로만 유도.\n"
+    return base + "스타일: If-Then 트리거/프리모템/우선순위/Quick Win을 모두 질문으로만 유도.\n"
 
 
 def build_context_block() -> str:
@@ -488,46 +569,146 @@ def build_context_block() -> str:
         tag = "PROBE" if qa.get("kind") == "probe" else "MAIN"
         hist += f"{i}) ({tag}) Q: {qa['q']}\n   A: {qa['a']}\n"
 
-    opts = [o.strip() for o in (st.session_state.options or "").split(",") if o.strip()]
+    opts = parse_options()
     opts_txt = "\n".join([f"- {o}" for o in opts]) if opts else "(미입력)"
 
-    return textwrap.dedent(f"""
-    [세션 시작 정보]
-    - 카테고리: {st.session_state.category}
-    - 결정 유형: {st.session_state.decision_type}
-    - 상황 설명: {st.session_state.situation or "(미입력)"}
-    - 원하는 목표: {st.session_state.goal or "(미입력)"}
-    - 고려 옵션(있다면): {opts_txt}
+    return textwrap.dedent(
+        f"""
+        [세션 시작 정보]
+        - 카테고리: {st.session_state.category}
+        - 결정 유형: {st.session_state.decision_type}
+        - 상황 설명: {st.session_state.situation or "(미입력)"}
+        - 원하는 목표: {st.session_state.goal or "(미입력)"}
+        - 고려 옵션(있다면): {opts_txt}
 
-    [최근 Q/A]
-    {hist if hist.strip() else "(아직 없음)"}
-    """).strip()
+        [최근 Q/A]
+        {hist if hist.strip() else "(아직 없음)"}
+        """
+    ).strip()
 
 
 def probing_instruction(last_q: str, last_a: str) -> str:
-    # 짧은 답변을 구체화하는 “심층 질문” 목적
-    return textwrap.dedent(f"""
-    사용자의 답변이 너무 짧거나 모호합니다.
-    아래의 직전 질문과 답변을 바탕으로, 사용자가 구체화할 수 있도록 딱 1개의 추가 질문(Probe)을 만들어 주세요.
+    return textwrap.dedent(
+        f"""
+        사용자의 답변이 너무 짧거나 모호합니다.
+        아래의 직전 질문과 답변을 바탕으로, 사용자가 구체화할 수 있도록 딱 1개의 추가 질문(Probe)을 만들어 주세요.
 
-    - 직전 질문: {last_q}
-    - 직전 답변: {last_a}
+        - 직전 질문: {last_q}
+        - 직전 답변: {last_a}
 
-    요구사항:
-    - '구체화'를 돕는 질문(예: 예시/상황/기준/이유/범위/기간/우선순위 중 하나를 더 묻기)
-    - 판단/추천/지시 금지
-    - 질문 1개만 출력
-    """).strip()
+        요구사항:
+        - '구체화'를 돕는 질문(예: 예시/상황/기준/이유/범위/기간/우선순위 중 하나를 더 묻기)
+        - 판단/추천/지시 금지
+        - 질문 1개만 출력
+        """
+    ).strip()
+
+
+def crosscheck_system_prompt() -> str:
+    return (
+        "당신은 'AI 결정 코칭 앱'의 논리 충돌 감지기입니다.\n"
+        "사용자의 이전 답변들 사이에 '우선순위/기준/목표'가 서로 충돌하는지 점검하세요.\n"
+        "중요: 추천/결론/정답/지시를 절대 하지 마세요. 질문을 만들 때도 강요/판단 금지.\n"
+        "출력은 반드시 JSON만. (설명/코드블록 금지)\n"
+    )
+
+
+def crosscheck_user_prompt(current_main_index: int) -> str:
+    # main 답변만 대상으로 최근 6개 정도로 교차 검증
+    mains = [x for x in st.session_state.answers if x.get("kind") == "main"]
+    tail = mains[-6:]
+    qa = ""
+    for i, x in enumerate(tail, start=1):
+        qa += f"{i}) Q: {x['q']}\n   A: {x['a']}\n"
+
+    return textwrap.dedent(
+        f"""
+        아래는 사용자 답변 일부입니다. 답변들 사이에 논리적 충돌(기준/우선순위의 상충)이 있는지 판단하세요.
+        충돌이 있다면, 그 충돌을 사용자가 스스로 '정리'하도록 돕는 질문 1개를 제안하세요.
+        충돌이 없다면 has_conflict=false로 두세요.
+
+        [답변들]
+        {qa if qa.strip() else "(답변 없음)"}
+
+        [출력 JSON 스키마]
+        {{
+          "has_conflict": true/false,
+          "conflict_summary": "string (없으면 빈 문자열)",
+          "question": "string (has_conflict=true일 때만, 질문 1개)"
+        }}
+
+        추가 규칙:
+        - question은 질문 1개만(물음표 포함 권장)
+        - 판단/추천/지시/선택 강요 금지
+        - 같은 내용을 반복하지 않게 간결하게
+        - current_main_index={current_main_index}
+        """
+    ).strip()
+
+
+def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    t = text.strip()
+    if not t.startswith("{"):
+        m = re.search(r"\{.*\}", t, flags=re.S)
+        if m:
+            t = m.group(0).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        return None
+
+
+def try_logic_crosscheck_question(main_index: int) -> Tuple[Optional[str], List[str]]:
+    """
+    main 질문 생성 직전에 1회:
+    - 이전 main 답변들 간 충돌이 있으면, 그 충돌을 짚는 질문을 우선 반환
+    - main_index별 1회만 사용
+    """
+    dbg: List[str] = []
+    if main_index in st.session_state.crosscheck_used_for:
+        return None, dbg
+
+    # 답변이 충분히 쌓였을 때만(최소 2개 main)
+    mains = [x for x in st.session_state.answers if x.get("kind") == "main"]
+    if len(mains) < 2:
+        return None, dbg
+
+    system = crosscheck_system_prompt()
+    user = crosscheck_user_prompt(main_index)
+    txt, err, d = call_openai_text(system=system, user=user, temperature=0.2)
+    dbg.extend(d)
+    if not txt:
+        if err:
+            dbg.append(f"Crosscheck error: {err}")
+        return None, dbg
+
+    data = safe_json_parse(txt)
+    if not data:
+        dbg.append("Crosscheck JSON parse failed.")
+        return None, dbg
+
+    has_conflict = bool(data.get("has_conflict", False))
+    q = normalize(str(data.get("question", "") or ""))
+
+    if has_conflict and q:
+        st.session_state.crosscheck_used_for.add(main_index)
+        dbg.append("Crosscheck conflict detected -> using conflict question.")
+        return q, dbg
+
+    st.session_state.crosscheck_used_for.add(main_index)
+    dbg.append("Crosscheck: no conflict (or no question).")
+    return None, dbg
 
 
 def instruction_for_question(i: int, n: int, coach_id: str) -> str:
     """
-    (개선 반영)
-    - logic: 가정 깨기(역발상) 질문을 특정 단계에 고정
+    고정 로직:
+    - logic: 가정 깨기(역발상) 고정 질문 포함
     - value: 감정 후 '감정 vs 가치 분리' 고정
-    - action: 마지막에 5분 Quick Win 고정
+    - action: If-Then 트리거 + Pre-mortem 포함 + 마지막 Quick Win
     """
-    # 공통 초반
     if i == 0:
         return "상황의 핵심을 더 구체화하는 질문 1개"
     if i == 1:
@@ -535,28 +716,35 @@ def instruction_for_question(i: int, n: int, coach_id: str) -> str:
 
     # 실행 코치
     if coach_id == "action":
-        # 마지막은 Quick Win 고정
         if i == n - 1:
             return (
-                "‘이번 주 계획을 위해, 지금 앱을 끄고 나서 5분 안에 실행할 수 있는 가장 작은 행동’ "
-                "을 스스로 적게 만드는 질문 1개(Quick Win)"
+                "‘지금 앱을 끄고 나서 5분 안에 실행할 수 있는 가장 작은 행동’을 "
+                "스스로 적게 만드는 질문 1개(Quick Win, 추천 금지)"
             )
+
+        # n 크기에 따라 구성
         if i == 2:
             return "옵션/해야 할 일 3~6개를 펼치고 Top1~3 우선순위를 정리하게 하는 질문(효과/중요도/난이도 기준을 질문으로 제시)"
-        if i == 3 and n >= 5:
-            return "Top1을 ‘1년→이번 달→이번 주’로 쪼개 사용자가 계획을 적게 만드는 질문 1개"
-        if i == n - 2:
-            return "이번 주 계획을 방해할 장애물과 If-Then 대응을 스스로 쓰게 하는 질문 1개"
-        return "이번 주 계획을 더 구체화(무엇을/얼마나/언제)하는 질문 1개"
+        if n >= 6 and i == 3:
+            return "Top1을 ‘1년→이번 달→이번 주’로 쪼개 사용자가 계획을 적게 만드는 질문 1개(지시 금지)"
+        if (n == 5 and i == 3) or (n >= 6 and i == n - 2):
+            return (
+                "프리모템(Pre-mortem) + If-Then 트리거 설계 질문 1개. "
+                "예: ‘2주 뒤 실패했다고 가정하면, 가장 그럴듯한 원인 3가지는?’ "
+                "그리고 각 원인에 대해 ‘만약 (If) ~ 상황이면 → (Then) ~ 행동’으로 대응을 적게 하기"
+            )
+        # 중간 단계: If-Then 트리거를 더 명확히
+        if n >= 6 and i == 4:
+            return "실행을 ‘언제’가 아니라 ‘If(어떤 상황) → Then(어떤 행동)’으로 설계하게 하는 질문 1개(트리거 2~3개)"
+        return "다음 행동을 더 구체화(무엇을/얼마나/어떤 조건에서)하는 질문 1개"
 
     # 구조 코치
     if coach_id == "logic":
-        # 가정 깨기 질문을 가능한 중후반에 고정
         if n >= 5 and i == n - 2:
             return (
                 "역발상/반대 상황 가정 질문 1개. "
                 "예: ‘만약 당신이 세운 기준이 완전히 틀렸다면 어떤 상황이 벌어질까요?’ "
-                "또는 ‘가장 가능성이 낮다고 생각하는 옵션이 정답이 될 수 있는 시나리오는?’"
+                "또는 ‘가장 가능성이 낮다고 생각하는 옵션이 유리해지는 시나리오는?’"
             )
         if i == 2:
             return "선택 기준(3~5)을 뽑게 하는 질문 1개"
@@ -570,7 +758,6 @@ def instruction_for_question(i: int, n: int, coach_id: str) -> str:
     if coach_id == "value":
         if i == 2:
             return "지금 감정(2~3개)과 그 감정의 이유를 말하게 하는 질문 1개"
-        # 감정 후에 '감정 vs 가치 분리' 고정
         if i == 3 and n >= 5:
             return (
                 "감정과 가치의 분리 질문 1개. "
@@ -582,6 +769,8 @@ def instruction_for_question(i: int, n: int, coach_id: str) -> str:
             return "마지막으로 ‘내 기준’을 한 문장으로 정리하게 하는 질문 1개(추천 금지)"
         return "가치 Top3(내게 중요한 것)와 내려놓을 것 1개를 정리하게 하는 질문 1개"
 
+    return "사용자가 스스로 정리하도록 돕는 질문 1개"
+
 
 def fallback_question(coach_id: str, i: int, n: int) -> str:
     if i == 0:
@@ -591,14 +780,16 @@ def fallback_question(coach_id: str, i: int, n: int) -> str:
 
     if coach_id == "action":
         if i == n - 1:
-            return "이번 주 계획을 위해, 앱을 끄고 나서 5분 안에 할 수 있는 ‘가장 작은 행동’은 무엇인가요?"
+            return "앱을 끄고 나서 5분 안에 할 수 있는 ‘가장 작은 행동’은 무엇인가요?"
         if i == 2:
             return "옵션/해야 할 일 3~6개를 적고, 효과/중요도/난이도를 고려했을 때 Top3는 무엇인가요?"
-        if i == 3 and n >= 5:
-            return "Top1을 기준으로 ‘1년 목표 → 이번 달 목표 → 이번 주 계획(3개)’을 적어보면 무엇인가요?"
-        if i == n - 2:
-            return "이번 주 계획을 방해할 장애물 3가지를 적고, 각각 ‘만약 ~이면 → ~한다’로 대응을 써볼까요?"
-        return "이번 주 계획을 더 구체화하면(무엇을/얼마나/언제) 어떻게 적을 수 있나요?"
+        if (n == 5 and i == 3) or (n >= 6 and i == n - 2):
+            return "2주 뒤 실패했다고 가정하면, 가장 그럴듯한 원인 3가지는 무엇이고 각각 ‘만약 ~이면 → ~한다’로 대응을 적어볼 수 있나요?"
+        if n >= 6 and i == 3:
+            return "Top1을 ‘1년 목표 → 이번 달 목표 → 이번 주 계획(3개)’로 적어보면 무엇인가요?"
+        if n >= 6 and i == 4:
+            return "실행을 ‘언제’가 아니라 ‘만약(If) ~ 상황이면 → 그러면(Then) ~ 행동’으로 트리거 2~3개를 만들어보면 무엇인가요?"
+        return "다음 행동을 더 구체화하면(무엇을/얼마나/어떤 조건에서) 어떻게 적을 수 있나요?"
 
     if coach_id == "logic":
         if n >= 5 and i == n - 2:
@@ -626,43 +817,56 @@ def generate_question(i: int, n: int) -> Tuple[str, Optional[str], List[str]]:
     system = system_prompt_for_questions(coach)
     prev_qs = st.session_state.questions[:]
 
+    # 1) Logic Cross-Check: 충돌 질문 우선 생성(가능하면)
+    cross_q, cross_dbg = try_logic_crosscheck_question(i)
+    if cross_q:
+        # 중복 방지 체크는 아래 공통 로직에서 처리(너무 비슷하면 fallback)
+        if not any(is_similar(cross_q, pq) for pq in prev_qs):
+            return cross_q, None, cross_dbg
+        cross_dbg.append("Crosscheck question was similar to previous. Falling back to normal generation.")
+        # 이어서 일반 생성 진행
+    dbg_acc: List[str] = cross_dbg[:]
+
     def prompt(nonce: int) -> str:
         prev_txt = "\n".join([f"- {q}" for q in prev_qs]) if prev_qs else "(없음)"
-        return textwrap.dedent(f"""
-        [이전 질문 목록]
-        {prev_txt}
+        return textwrap.dedent(
+            f"""
+            [이전 질문 목록]
+            {prev_txt}
 
-        {build_context_block()}
+            {build_context_block()}
 
-        [이번 질문 목적]
-        {instruction_for_question(i, n, coach["id"])}
+            [이번 질문 목적]
+            {instruction_for_question(i, n, coach["id"])}
 
-        규칙:
-        - 결론/추천/정답/지시 금지
-        - 질문 1개만 출력
-        - 이전 질문과 너무 비슷하면 피하기
+            규칙:
+            - 결론/추천/정답/지시 금지
+            - 질문 1개만 출력
+            - 이전 질문과 너무 비슷하면 피하기
 
-        (nonce={nonce})
-        """).strip()
+            (nonce={nonce})
+            """
+        ).strip()
 
     q1, err, dbg = call_openai_text(system=system, user=prompt(random.randint(1000, 9999)), temperature=0.7)
+    dbg_acc.extend(dbg)
     if not q1:
-        return fallback_question(coach["id"], i, n), err, dbg
+        return fallback_question(coach["id"], i, n), err, dbg_acc
 
     q1 = normalize(q1)
     if not any(is_similar(q1, pq) for pq in prev_qs):
-        return q1, None, dbg
+        return q1, None, dbg_acc
 
-    dbg.append("Similar question detected. Regenerating once.")
+    dbg_acc.append("Similar question detected. Regenerating once.")
     q2, err2, dbg2 = call_openai_text(system=system, user=prompt(random.randint(10000, 99999)), temperature=0.85)
-    dbg.extend(dbg2)
+    dbg_acc.extend(dbg2)
     if q2:
         q2 = normalize(q2)
         if not any(is_similar(q2, pq) for pq in prev_qs):
-            return q2, None, dbg
+            return q2, None, dbg_acc
 
-    dbg.append("Still similar after retry. Using fallback.")
-    return fallback_question(coach["id"], i, n), None, dbg
+    dbg_acc.append("Still similar after retry. Using fallback.")
+    return fallback_question(coach["id"], i, n), err2, dbg_acc
 
 
 def ensure_question(index: int, total: int) -> None:
@@ -679,7 +883,6 @@ def generate_probe_question(last_q: str, last_a: str) -> Tuple[str, Optional[str
     user = probing_instruction(last_q, last_a)
     q, err, dbg = call_openai_text(system=system, user=user, temperature=0.6)
     if not q:
-        # fallback probe
         return "방금 답변에서 ‘예시 1개’만 들어서 조금 더 자세히 설명해줄 수 있을까요?", err, dbg
     return normalize(q), None, dbg
 
@@ -787,20 +990,6 @@ JSON 스키마:
     ).strip()
 
 
-def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
-    if not text:
-        return None
-    t = text.strip()
-    if not t.startswith("{"):
-        m = re.search(r"\{.*\}", t, flags=re.S)
-        if m:
-            t = m.group(0).strip()
-    try:
-        return json.loads(t)
-    except Exception:
-        return None
-
-
 def system_prompt_for_report() -> str:
     return (
         "당신은 'AI 결정 코칭 앱'의 최종 요약 생성기입니다.\n"
@@ -813,7 +1002,6 @@ def system_prompt_for_report() -> str:
 
 def build_qa_text_for_report() -> str:
     qa_text = ""
-    # main/probe 모두 포함하되 순서대로
     for i, qa in enumerate(st.session_state.answers, start=1):
         tag = "PROBE" if qa.get("kind") == "probe" else "MAIN"
         qa_text += f"{i}) ({tag}) Q: {qa['q']}\n   A: {qa['a']}\n"
@@ -825,9 +1013,10 @@ def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str
     system = system_prompt_for_report()
 
     qa_text = build_qa_text_for_report()
-    opts = [o.strip() for o in (st.session_state.options or "").split(",") if o.strip()]
+    opts = parse_options()
 
-    user = textwrap.dedent(f"""
+    user = textwrap.dedent(
+        f"""
 {report_schema_hint(coach["id"])}
 
 [세션 시작 정보]
@@ -844,18 +1033,17 @@ def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str
 - 추천/결론/정답/지시 금지
 - coaching_message는 거울 비추기만
 - 사용자가 말하지 않은 계획을 ‘지어내지’ 마세요
-""").strip()
+"""
+    ).strip()
 
     text, err, dbg = call_openai_text(system=system, user=user, temperature=0.25)
     if not text:
         return None, err, dbg, None
 
-    # 1차 파싱
     data = safe_json_parse(text)
     if data is None:
         return None, "리포트 JSON 파싱 실패(모델이 JSON만 출력하지 않았을 수 있음)", dbg, text
 
-    # 추천/지시 문구 방지: coaching_message / 전체 문자열 검사
     combined = json.dumps(data, ensure_ascii=False)
     if contains_forbidden_recommendation(combined):
         dbg.append("Forbidden recommendation-like phrasing detected. Regenerating once with stricter warning.")
@@ -866,7 +1054,6 @@ def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str
             data2 = safe_json_parse(text2)
             if data2 is not None and not contains_forbidden_recommendation(json.dumps(data2, ensure_ascii=False)):
                 return data2, None, dbg, text2
-        # 재생성 실패 시에도 반환은 하되, 사용자에게 경고 표시 가능
         dbg.append("Regeneration did not fully remove forbidden phrasing.")
         return data, None, dbg, text
 
@@ -900,16 +1087,21 @@ def render_summary_block(data: Dict[str, Any]) -> None:
             st.caption("옵션이 명확히 언급되지 않았어요.")
 
 
-def render_criteria(data: Dict[str, Any]) -> None:
+def render_criteria(data: Dict[str, Any]) -> List[str]:
     st.subheader("선택 기준 정리(우선순위 포함)")
     crit = data.get("criteria", []) or []
     if not crit:
         st.caption("선택 기준이 충분히 드러나지 않았어요.")
-        return
+        return []
     rows = []
+    names: List[str] = []
     for c in crit:
-        rows.append({"기준": c.get("name", ""), "우선순위(1~5)": c.get("priority", ""), "왜 중요한가": c.get("why", "")})
+        nm = str(c.get("name", "") or "").strip()
+        if nm:
+            names.append(nm)
+        rows.append({"기준": nm, "우선순위(1~5)": c.get("priority", ""), "왜 중요한가": c.get("why", "")})
     st.dataframe(rows, use_container_width=True, hide_index=True)
+    return names
 
 
 def render_action_visualization(data: Dict[str, Any]) -> None:
@@ -975,6 +1167,286 @@ def render_next_question(data: Dict[str, Any]) -> None:
 
 
 # =========================
+# Mirroring 분석(키워드/감정어)
+# =========================
+STOPWORDS = {
+    "그냥",
+    "너무",
+    "진짜",
+    "근데",
+    "그리고",
+    "그래서",
+    "하지만",
+    "제가",
+    "저는",
+    "나는",
+    "내가",
+    "이게",
+    "그게",
+    "저",
+    "것",
+    "수",
+    "좀",
+    "약간",
+    "때문",
+    "때문에",
+    "같아요",
+    "같은",
+    "하는",
+    "해야",
+    "하고",
+    "있는",
+    "있다",
+    "없다",
+    "없어요",
+    "모르겠",
+    "모르겠어요",
+}
+
+EMOTION_WORDS = [
+    "불안",
+    "두려움",
+    "걱정",
+    "긴장",
+    "답답",
+    "후회",
+    "죄책감",
+    "부담",
+    "스트레스",
+    "우울",
+    "짜증",
+    "화",
+    "분노",
+    "설렘",
+    "기대",
+    "안도",
+    "편안",
+    "행복",
+    "의욕",
+    "지침",
+    "번아웃",
+]
+
+
+def analyze_mirroring_from_answers() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    text = " ".join([str(x.get("a", "")) for x in st.session_state.answers if x.get("a")])
+    clean = re.sub(r"[^\w가-힣 ]", " ", text)
+    clean = re.sub(r"\s+", " ", clean).strip().lower()
+
+    toks = [t for t in clean.split(" ") if len(t) >= 2 and t not in STOPWORDS]
+    # 키워드 빈도
+    freq: Dict[str, int] = {}
+    for t in toks:
+        freq[t] = freq.get(t, 0) + 1
+    kw = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:10]
+    kw_df = pd.DataFrame(kw, columns=["키워드", "빈도"])
+
+    # 감정어 빈도(부분 포함)
+    emo_freq: Dict[str, int] = {}
+    for ew in EMOTION_WORDS:
+        c = len(re.findall(re.escape(ew), text))
+        if c > 0:
+            emo_freq[ew] = c
+    emo = sorted(emo_freq.items(), key=lambda x: x[1], reverse=True)[:10]
+    emo_df = pd.DataFrame(emo, columns=["감정어", "빈도"])
+    return kw_df, emo_df
+
+
+def render_mirroring_visual() -> None:
+    st.subheader("내면의 목소리(Mirroring) — 답변에서 많이 등장한 표현")
+    kw_df, emo_df = analyze_mirroring_from_answers()
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.write("**자주 등장한 키워드(Top 10)**")
+        if len(kw_df) == 0:
+            st.caption("키워드가 충분히 잡히지 않았어요.")
+        else:
+            st.dataframe(kw_df, use_container_width=True, hide_index=True)
+            st.bar_chart(kw_df.set_index("키워드")["빈도"])
+    with c2:
+        st.write("**감정어(Top 10)**")
+        if len(emo_df) == 0:
+            st.caption("뚜렷한 감정어가 많이 등장하지 않았어요.")
+        else:
+            st.dataframe(emo_df, use_container_width=True, hide_index=True)
+            st.bar_chart(emo_df.set_index("감정어")["빈도"])
+
+    st.caption("이 결과는 ‘정답’이 아니라, 당신의 답변에 나타난 반복 표현을 요약한 거울입니다.")
+
+
+# =========================
+# 의사결정 매트릭스
+# =========================
+def build_decision_matrix(options: List[str], criteria_names: List[str]) -> pd.DataFrame:
+    if not options:
+        options = ["옵션 1", "옵션 2"]
+    if not criteria_names:
+        criteria_names = ["기준 1", "기준 2", "기준 3"]
+
+    cols = ["옵션"] + criteria_names + ["메모"]
+    rows = []
+    for opt in options:
+        r = {"옵션": opt, "메모": ""}
+        for c in criteria_names:
+            r[c] = 3
+        rows.append(r)
+    return pd.DataFrame(rows, columns=cols)
+
+
+def render_decision_matrix(criteria_names: List[str], data: Dict[str, Any]) -> None:
+    st.subheader("의사결정 매트릭스(직접 점수 매기기)")
+    st.caption("각 옵션이 ‘내 기준’에서 어느 정도인지 1~5점으로 적어보세요. 점수 자체는 결론이 아니라, 생각을 꺼내는 도구예요.")
+
+    # 옵션 소스: 사용자 입력 options → 없으면 리포트의 options_mentioned → 그래도 없으면 기본
+    user_opts = parse_options()
+    report_opts = (data.get("summary", {}) or {}).get("options_mentioned", []) or []
+    opts = user_opts or [str(x) for x in report_opts if str(x).strip()] or ["옵션 1", "옵션 2"]
+
+    if st.session_state.decision_matrix_df is None:
+        st.session_state.decision_matrix_df = build_decision_matrix(opts, criteria_names)
+
+    df: pd.DataFrame = st.session_state.decision_matrix_df
+
+    # 옵션 변경에 대응(간단 동기화)
+    existing_opts = [str(x) for x in df["옵션"].tolist()] if "옵션" in df.columns else []
+    if set(existing_opts) != set(opts):
+        st.session_state.decision_matrix_df = build_decision_matrix(opts, criteria_names)
+        df = st.session_state.decision_matrix_df
+
+    # 기준 변경에 대응(간단 동기화)
+    desired_cols = ["옵션"] + (criteria_names or []) + ["메모"]
+    if list(df.columns) != desired_cols:
+        st.session_state.decision_matrix_df = build_decision_matrix(opts, criteria_names)
+        df = st.session_state.decision_matrix_df
+
+    col_cfg: Dict[str, Any] = {}
+    for c in criteria_names:
+        col_cfg[c] = st.column_config.NumberColumn(c, min_value=1, max_value=5, step=1, format="%d")
+
+    edited = st.data_editor(
+        df,
+        use_container_width=True,
+        hide_index=True,
+        column_config=col_cfg,
+        num_rows="fixed",
+    )
+    st.session_state.decision_matrix_df = edited
+
+    # 합계(참고용)
+    if criteria_names:
+        try:
+            totals = edited[criteria_names].sum(axis=1)
+            show = edited.copy()
+            show["총점(참고)"] = totals
+            st.write("**총점(참고용)**")
+            st.dataframe(show[["옵션", "총점(참고)"]], use_container_width=True, hide_index=True)
+            st.caption("총점은 ‘결론’이 아니라, 어떤 옵션이 어떤 기준에서 강/약한지 다시 보게 하는 참고치예요.")
+        except Exception:
+            pass
+
+
+# =========================
+# 공유/저장(클립보드 + 다운로드)
+# =========================
+def render_copy_to_clipboard_button(text: str, button_label: str = "클립보드에 복사") -> None:
+    # Streamlit 기본에 복사 기능이 없어 JS로 구현
+    # (HTTPS/브라우저 정책에 따라 동작하지 않을 수 있음)
+    safe = text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+    html = f"""
+    <div style="display:flex; gap:8px; align-items:center;">
+      <button
+        onclick="navigator.clipboard.writeText(`{safe}`).then(()=>{{const el=document.getElementById('cpmsg'); el.innerText='복사됨'; setTimeout(()=>el.innerText='',1200);}});"
+        style="padding:8px 12px; border-radius:10px; border:1px solid #444; background:#111; color:#fff; cursor:pointer;">
+        {button_label}
+      </button>
+      <span id="cpmsg" style="font-size:12px; opacity:0.8;"></span>
+    </div>
+    """
+    st.components.v1.html(html, height=55)
+
+
+def build_report_text_for_export(data: Dict[str, Any]) -> str:
+    lines: List[str] = []
+    lines.append("🪨 돌멩이 AI 결정 코칭 — 최종 정리(거울 비추기)")
+    lines.append(f"- 생성 시각: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    lines.append("[세션 정보]")
+    lines.append(f"- 카테고리: {st.session_state.category}")
+    lines.append(f"- 결정 유형: {st.session_state.decision_type}")
+    lines.append(f"- 상황 설명: {st.session_state.situation}")
+    lines.append(f"- 목표: {st.session_state.goal}")
+    lines.append(f"- 옵션: {st.session_state.options or '(없음)'}")
+    lines.append("")
+    lines.append("[리포트 JSON]")
+    lines.append(json.dumps(data, ensure_ascii=False, indent=2))
+    lines.append("")
+    lines.append("[Q/A]")
+    for i, qa in enumerate(st.session_state.answers, start=1):
+        tag = "PROBE" if qa.get("kind") == "probe" else "MAIN"
+        lines.append(f"{i}. ({tag}) Q: {qa['q']}")
+        lines.append(f"   A: {qa['a']}")
+        lines.append(f"   ts: {qa['ts']}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+# =========================
+# Back 버튼 로직
+# =========================
+def handle_back() -> None:
+    """
+    요구사항:
+    - 질문 화면에서 q_index를 줄이고 answers에서 마지막 답변을 제거하여 이전 질문으로 돌아가기
+    - probe 상태가 꼬이지 않도록 정리
+    """
+    if not st.session_state.answers:
+        st.session_state.q_index = max(0, int(st.session_state.q_index) - 1)
+        st.session_state.probe_active = False
+        st.session_state.probe_question = ""
+        st.session_state.probe_for_index = None
+        return
+
+    last = st.session_state.answers.pop()
+
+    # probe는 같은 main_index에 대한 추가 질문이므로, 뒤로 가기 시 probe 모드 해제하고 해당 main으로 유지
+    if last.get("kind") == "probe":
+        st.session_state.probe_active = False
+        st.session_state.probe_question = ""
+        st.session_state.probe_for_index = None
+        # q_index는 last의 main_index로 맞춤(대개 현재)
+        st.session_state.q_index = int(last.get("main_index", st.session_state.q_index))
+        return
+
+    # main 답변을 되돌리면, 해당 질문으로 돌아가야 함
+    mi = int(last.get("main_index", 0))
+    st.session_state.probe_active = False
+    st.session_state.probe_question = ""
+    st.session_state.probe_for_index = None
+    st.session_state.q_index = max(0, mi)
+
+
+# =========================
+# Sidebar: 결정 유형 템플릿 자동 입력
+# =========================
+def on_decision_type_change() -> None:
+    new_dt = st.session_state.decision_type
+    prev_dt = st.session_state.last_decision_type
+    st.session_state.last_decision_type = new_dt
+
+    template = DECISION_TEMPLATES.get(new_dt, "")
+    if not template:
+        return
+
+    cur = (st.session_state.situation or "").strip()
+    # "자동 입력"이지만, 사용자가 이미 작성한 내용을 덮어쓰지 않도록:
+    # - 비어있거나
+    # - 기존이 [가이드]로 시작하면(템플릿 상태) 덮어쓰기
+    if (not cur) or cur.startswith("[가이드]"):
+        st.session_state.situation = template
+
+
+# =========================
 # App UI
 # =========================
 init_state()
@@ -986,10 +1458,20 @@ with st.sidebar:
     st.divider()
     st.subheader("상황 설정(세션 시작)")
     st.selectbox("카테고리", [x[0] for x in TOPIC_CATEGORIES], key="category")
-    st.selectbox("결정 유형", DECISION_TYPES, key="decision_type")
-    st.text_area("상황 설명", key="situation", height=90, placeholder="무슨 일이 있었고 무엇을 결정해야 하나요?")
+
+    st.selectbox("결정 유형", DECISION_TYPES, key="decision_type", on_change=on_decision_type_change)
+
+    st.text_area("상황 설명", key="situation", height=120, placeholder="무슨 일이 있었고 무엇을 결정해야 하나요?")
     st.text_input("원하는 목표", key="goal", placeholder="이 결정에서 얻고 싶은 결과(가능하면 측정 가능하게)")
     st.text_input("옵션(쉼표로 구분, 선택)", key="options", placeholder="예: A, B, C")
+
+    with st.expander("결정 유형 가이드 다시 넣기"):
+        st.caption("상황 설명이 비어있거나 [가이드] 텍스트라면, 결정 유형에 맞춘 템플릿이 자동으로 들어갑니다.")
+        if st.button("가이드 삽입/갱신", use_container_width=True):
+            tmpl = DECISION_TEMPLATES.get(st.session_state.decision_type, "")
+            if tmpl:
+                st.session_state.situation = tmpl
+                st.rerun()
 
     st.divider()
     st.subheader("코치 선택")
@@ -1023,6 +1505,7 @@ with st.sidebar:
             done = main_answer_count() >= int(st.session_state.num_questions)
             if st.button("최종 결과로", use_container_width=True, disabled=not done):
                 st.session_state.page = "report"
+                st.session_state.report_just_entered = True
                 st.rerun()
         else:
             if st.button("질문 페이지로", use_container_width=True):
@@ -1036,7 +1519,6 @@ labels = ["설정"] + [f"Q{i}" for i in range(1, nq + 1)] + ["요약"]
 if st.session_state.page == "setup":
     idx = 0
 elif st.session_state.page == "questions":
-    # probe 중이면 같은 돌에 머무르는 느낌(현재 질문 인덱스 유지)
     idx = 1 + int(st.session_state.q_index)
 else:
     idx = 1 + nq
@@ -1068,7 +1550,7 @@ if st.session_state.page == "setup":
 
 elif st.session_state.page == "questions":
     st.title("질문")
-    st.caption("한 화면에 한 질문. 답변을 저장하면 다음으로 진행합니다. (답변이 너무 짧으면 한 번 더 구체화 질문을 합니다)")
+    st.caption("한 화면에 한 질문. 답변을 저장하면 다음으로 진행합니다. (답변이 10자 미만이면 1회 구체화 질문을 합니다)")
 
     q_idx = int(st.session_state.q_index)
     q_idx = max(0, min(q_idx, nq - 1))
@@ -1087,6 +1569,15 @@ elif st.session_state.page == "questions":
         kind = "main"
         badge = "메인 질문"
 
+    # 상단 컨트롤: Back
+    top_c1, top_c2, top_c3 = st.columns([1, 2, 1])
+    with top_c1:
+        if st.button("⬅️ 이전으로", use_container_width=True, disabled=(q_idx == 0 and not st.session_state.answers)):
+            handle_back()
+            st.rerun()
+    with top_c3:
+        st.caption(f"메인 답변: {main_answer_count()} / {nq}")
+
     st.subheader(f"Q{q_idx + 1} / {nq}  ·  {badge}")
     with st.container(border=True):
         st.markdown(f"**{show_q}**")
@@ -1104,30 +1595,28 @@ elif st.session_state.page == "questions":
         if not a:
             st.warning("답변이 비어 있습니다. 한 줄만 입력해도 진행 가능합니다.")
         else:
-            # 저장
             add_answer(show_q, a, kind=kind, main_index=q_idx)
 
             if kind == "probe":
-                # probe를 끝내고 다음 main 질문으로 진행
+                # probe 종료 → 다음 main으로
                 st.session_state.probe_active = False
                 st.session_state.probe_question = ""
                 st.session_state.probe_for_index = None
                 st.session_state.q_index = min(q_idx + 1, nq - 1)
 
             else:
-                # main 답변이 너무 짧으면 probe 생성하고 같은 단계 유지
+                # main 답변이 너무 짧으면 probe 생성(1회) + 같은 단계 유지
                 if is_too_short_answer(a):
                     pq, err, dbg = generate_probe_question(show_q, a)
                     st.session_state.debug_log = dbg
                     st.session_state.probe_active = True
                     st.session_state.probe_question = pq
                     st.session_state.probe_for_index = q_idx
-                    # q_index는 그대로
-
                 else:
                     # 정상 진행
                     if main_answer_count() >= nq:
                         st.session_state.page = "report"
+                        st.session_state.report_just_entered = True
                         st.session_state.q_index = nq - 1
                     else:
                         st.session_state.q_index = min(q_idx + 1, nq - 1)
@@ -1135,7 +1624,6 @@ elif st.session_state.page == "questions":
             st.rerun()
 
     with st.expander("답변 기록"):
-        # main/probe 다 보여주되, main_index 기준으로 묶어서 보기 좋게
         grouped: Dict[int, List[Dict[str, Any]]] = {}
         for qa in st.session_state.answers:
             grouped.setdefault(int(qa.get("main_index", 0)), []).append(qa)
@@ -1155,6 +1643,10 @@ elif st.session_state.page == "questions":
 else:
     st.title("최종 정리")
     st.caption("추천/정답 없이, 고민의 핵심과 기준을 ‘거울 비추기’ 방식으로 정리합니다.")
+
+    if st.session_state.report_just_entered:
+        st.balloons()
+        st.session_state.report_just_entered = False
 
     if main_answer_count() < nq:
         st.warning("아직 모든 메인 질문이 완료되지 않았습니다. 질문 페이지로 돌아가 답변을 완료하세요.")
@@ -1188,8 +1680,12 @@ else:
         st.success("최종 정리가 준비되었습니다.")
 
         render_summary_block(data)
-        render_criteria(data)
+        criteria_names = render_criteria(data)
 
+        # 의사결정 매트릭스(옵션x기준)
+        render_decision_matrix(criteria_names, data)
+
+        # 코치별 섹션
         if coach["id"] == "action":
             render_action_visualization(data)
         elif coach["id"] == "logic":
@@ -1197,15 +1693,35 @@ else:
         else:
             render_emotions_values(data)
 
+        # 내면의 목소리(Mirroring 시각화)
+        render_mirroring_visual()
+
         render_coaching_message(data)
         render_next_question(data)
+
+        st.subheader("공유/저장")
+        export_text = build_report_text_for_export(data)
+        render_copy_to_clipboard_button(export_text, "리포트 텍스트 복사")
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        st.download_button(
+            "리포트 .txt 다운로드",
+            data=export_text.encode("utf-8"),
+            file_name=f"pebble_decision_report_{ts}.txt",
+            mime="text/plain",
+            use_container_width=True,
+        )
 
         st.subheader("공유용(JSON)")
         st.code(json.dumps(data, ensure_ascii=False, indent=2), language="json")
 
-        # 혹시라도 금지 표현이 남아있을 때 사용자에게만 경고(내용은 그대로)
         if contains_forbidden_recommendation(json.dumps(data, ensure_ascii=False)):
-            st.warning("리포트에 추천/지시처럼 보이는 표현이 섞였을 수 있어요. 필요하면 ‘정리 생성/새로고침’을 한 번 더 눌러 보세요.")
+            st.warning("리포트에 추천/지시처럼 보이는 표현이 섞였을 수 있어요. 필요하면 ‘정리 생성/새로고침’을 눌러 보세요.")
+
+        # 결정 유효기간 문구
+        valid_until = (datetime.now().date() + timedelta(days=7)).strftime("%Y-%m-%d")
+        st.divider()
+        st.caption(f"이 정리는 **{valid_until}**까지 유효합니다.")
 
     elif st.session_state.final_report_raw:
         st.warning("JSON 파싱 실패로 원문을 표시합니다.")
@@ -1230,5 +1746,7 @@ with st.expander("배포 체크리스트 (Streamlit Cloud)"):
 - requirements.txt:
   - streamlit
   - openai
+  - pandas
 """
     )
+
