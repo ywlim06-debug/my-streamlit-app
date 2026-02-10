@@ -1,16 +1,22 @@
 # app.py
 # ─────────────────────────────────────────────────────────────
-# 🪨 돌멩이 AI 결정 코칭 (질문으로 정리하는 앱) + "돌다리 건너는 사람" 진행 애니메이션
+# 🪨 돌멩이 AI 결정 코칭 (Pebble Decision Coach)
 #
 # 계획서 준수:
-# - 정답/결론/추천 제공 금지(강제)
+# - 정답/결론/추천 제공 금지
 # - 한 화면에 한 질문씩
-# - 이전 답변 반영 동적 질문
+# - 이전 답변 반영 동적 질문 생성
 # - 마지막: 고민의 핵심 / 선택 기준 / 코칭 메시지(추천 금지)
-# - 계획 시각화는 "사용자 답변 기반 정리"만
 #
 # 추가 기능:
-# - 돌멩이 위를 사람이 건너는 진행 UI (질문 넘어갈 때마다 이동)
+# - 질문 개수 설정(2~10)
+# - 질문 완료 후 레포트 페이지로 이동
+# - 질문 중복 방지(유사하면 재생성 + fallback)
+# - 실행 코치: 우선순위 + 계획(년→달→주) + 장애물 If-Then 질문
+# - 돌다리 진행 UI: 돌 위를 사람이(🚶) 건너감
+#   - 사람 아이콘 크게(40px)
+#   - 방향 반대(좌측 바라봄)
+# - PIL 미사용 (SVG base64 HTML 렌더)
 #
 # 필요:
 #   pip install streamlit openai
@@ -136,22 +142,14 @@ def pebble_svg_b64(progress_0_to_1: float, inactive: bool = False) -> str:
 
 
 # =========================
-# New: Pebble bridge with walker
+# Pebble bridge with walker
 # =========================
 def render_pebble_bridge(current_idx: int, total: int, labels: List[str]) -> None:
-    """
-    돌멩이 다리 위를 사람이 이동하는 UI.
-    - current_idx: 현재 스텝 인덱스(0..total-1)
-    - total: 전체 스텝 수
-    """
     total = max(2, int(total))
     current_idx = max(0, min(int(current_idx), total - 1))
 
-    # 사람 위치를 "돌 중심" 기준으로 매핑
-    # 0% ~ 100% 구간에서, 각 돌의 중심은 (i+0.5)/total
     left_pct = ((current_idx + 0.5) / total) * 100.0
 
-    # 돌 이미지 리스트 생성
     pebble_imgs = []
     for i in range(total):
         active = i <= current_idx
@@ -159,15 +157,13 @@ def render_pebble_bridge(current_idx: int, total: int, labels: List[str]) -> Non
         b64 = pebble_svg_b64(p, inactive=not active)
         pebble_imgs.append(b64)
 
-    # HTML/CSS: 사람(🚶)이 left를 transition으로 이동
-    # Streamlit rerun 시 위치가 바뀌면서 부드럽게 이동
     html = """
 <style>
 .pebble-bridge-wrap{
   position: relative;
   width: 100%;
   margin: 6px 0 2px 0;
-  padding: 10px 4px 0 4px;
+  padding: 16px 4px 0 4px;
 }
 .pebble-row{
   display: flex;
@@ -194,22 +190,25 @@ def render_pebble_bridge(current_idx: int, total: int, labels: List[str]) -> Non
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* 사람(🚶) 크게 + 방향 반대로 */
 .walker{
   position: absolute;
-  top: 0px;
+  top: -10px;
   left: VAR_LEFT%;
-  transform: translateX(-50%);
-  font-size: 26px;
+  transform: translateX(-50%) scaleX(-1);
+  font-size: 40px;
   line-height: 1;
   transition: left 520ms cubic-bezier(.2,.9,.2,1);
   filter: drop-shadow(0px 2px 2px rgba(0,0,0,0.25));
   animation: bob 800ms ease-in-out infinite;
   user-select: none;
 }
+
 @keyframes bob{
-  0%{ transform: translateX(-50%) translateY(0px); }
-  50%{ transform: translateX(-50%) translateY(-2px); }
-  100%{ transform: translateX(-50%) translateY(0px); }
+  0%{ transform: translateX(-50%) translateY(0px) scaleX(-1); }
+  50%{ transform: translateX(-50%) translateY(-3px) scaleX(-1); }
+  100%{ transform: translateX(-50%) translateY(0px) scaleX(-1); }
 }
 </style>
 <div class="pebble-bridge-wrap">
@@ -280,7 +279,6 @@ def call_openai_text(system: str, user: str, temperature: float = 0.6) -> Tuple[
     except Exception as e:
         return None, str(e), debug
 
-    # Responses API 우선
     if hasattr(client, "responses"):
         for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
             try:
@@ -308,7 +306,6 @@ def call_openai_text(system: str, user: str, temperature: float = 0.6) -> Tuple[
             except Exception as e:
                 debug.append(f"Responses failed: {type(e).__name__}: {e}")
 
-    # Chat fallback
     for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
         try:
             debug.append(f"Chat Completions / model={model}")
@@ -487,7 +484,6 @@ def instruction_for_question(i: int, n: int, coach_id: str) -> str:
             return "불확실한 가정/추가로 확인할 정보 1~2개를 드러내는 질문 1개"
         return "마지막으로 선택 기준 우선순위를 정리하게 하는 질문 1개(추천 금지)"
 
-    # value
     if i == 2 and n >= 4:
         return "지금 감정(2~3개)과 그 감정의 이유를 말하게 하는 질문 1개"
     if i < n - 2:
@@ -519,7 +515,6 @@ def fallback_question(coach_id: str, i: int, n: int) -> str:
             return "지금 결정을 어렵게 만드는 ‘불확실한 정보/가정’은 무엇인가요?"
         return "내 기준(우선순위)을 1~3위로 정리하면 무엇인가요?"
 
-    # value
     if i == 2 and n >= 4:
         return "지금 감정을 2~3개 단어로 적고, 각 감정이 생긴 이유를 한 줄씩 써볼까요?"
     if i == n - 2:
@@ -579,7 +574,7 @@ def ensure_question(index: int, total: int) -> None:
 
 
 # =========================
-# Final report JSON (요약/기준/코칭 메시지, 추천 금지)
+# Final report JSON (추천 금지)
 # =========================
 def report_schema_hint(coach_id: str) -> str:
     base = """
@@ -671,7 +666,7 @@ def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
         return None
 
 
-def system_prompt_for_report(_: Dict[str, Any]) -> str:
+def system_prompt_for_report() -> str:
     return (
         "당신은 'AI 결정 코칭 앱'의 최종 요약 생성기입니다.\n"
         "절대 정답/결론/추천을 제시하지 마세요.\n"
@@ -682,7 +677,7 @@ def system_prompt_for_report(_: Dict[str, Any]) -> str:
 
 def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str], List[str], Optional[str]]:
     coach = coach_by_id(st.session_state.coach_id)
-    system = system_prompt_for_report(coach)
+    system = system_prompt_for_report()
 
     qa_text = ""
     for i, qa in enumerate(st.session_state.answers, start=1):
@@ -751,7 +746,7 @@ def render_criteria(data: Dict[str, Any]) -> None:
     st.subheader("선택 기준 정리(우선순위 포함)")
     crit = data.get("criteria", []) or []
     if not crit:
-        st.caption("선택 기준이 충분히 드러나지 않았어요. 다음 질문을 참고해 보세요.")
+        st.caption("선택 기준이 충분히 드러나지 않았어요.")
         return
     rows = []
     for c in crit:
@@ -1035,4 +1030,3 @@ with st.expander("배포 체크리스트 (Streamlit Cloud)"):
   - openai
 """
     )
-
