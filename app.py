@@ -8,19 +8,20 @@
 # - 이전 답변 반영 동적 질문 생성
 # - 마지막: 고민의 핵심 / 선택 기준 / 코칭 메시지(거울 비추기, 추천 금지)
 #
-# 유지되는 기능(이전 버전 포함):
+# 유지 기능:
 # - Logic Cross-Check(답변 간 충돌 감지 → 충돌을 짚는 질문 우선 생성)
 # - Probing(답변 10자 미만이면 1회 구체화 질문)
+# - "잘 모르겠어요" 등 난감 답변 시: 질문 재프레이밍/대체 질문 1회 생성(상황 반영)
 # - Action Coach 강화: If-Then 트리거 + Pre-mortem 질문 포함
 # - Back 버튼
-# - 결정 유형별 템플릿(2단계에서 상황설명 가이드 삽입 버튼 제공)
+# - 결정 유형별 템플릿(2단계에서 상황설명 가이드 삽입 버튼)
 # - 리포트: 의사결정 매트릭스(st.data_editor), Mirroring 시각화, 복사/다운로드, 유효기간, balloons
 #
-# 이번 변경(온보딩 전면 수정):
-# - 사이드바 설정 제거 → 메인 화면 단계별 Onboarding Flow
-#   landing(고민 작성) -> setup_details(AI 분석/추천 + 수정) -> questions -> report
-# - 사이드바는 보조 기능(처음부터, 디버그 로그)만
-# - 진행바(render_pebble_bridge)에 landing/setup 단계 반영
+# 이번 수정(버그 + 기능):
+# 1) "처음부터 다시 하기" 후 2단계 AI 분석이 초기화되지 않는 문제 해결
+#    -> reset_flow에서 onboarding_* 상태(onboarding_reco/raw/applied)까지 명확히 초기화
+# 2) 질문 과정에서 "모르겠/감이 안 와" 등 난감 답변 시,
+#    -> 다음으로 넘어가지 않고 ‘상황을 반영한’ 재프레이밍/대체 질문을 1회 추가 생성
 #
 # 필요:
 #   pip install streamlit openai pandas
@@ -160,6 +161,19 @@ COACHES = [
 
 # Probing 기준: 10자 미만이면 1회 추가 질문
 MIN_ANSWER_CHARS = 10
+
+# "난감/모름" 답변 패턴(길이와 무관하게 트리거)
+CONFUSED_ANSWER_PATTERNS = [
+    r"모르겠",
+    r"잘\s*모르",
+    r"감이\s*안",
+    r"생각이\s*안",
+    r"어렵",
+    r"잘\s*모르겠",
+    r"모르겠어요",
+]
+
+# 짧은 답변 판단(기존 probing)
 SHORT_ANSWER_PATTERNS = [
     r"^모르겠",
     r"^잘\s*모르",
@@ -252,8 +266,6 @@ def render_pebble_bridge(current_idx: int, total: int, labels: List[str]) -> Non
   overflow: hidden;
   text-overflow: ellipsis;
 }
-
-/* 사람(🚶) 크게 + 방향 반대로 */
 .walker{
   position: absolute;
   top: -10px;
@@ -397,15 +409,12 @@ def coach_by_id(coach_id: str) -> Dict[str, Any]:
 
 
 def init_state() -> None:
-    # pages: landing -> setup_details -> questions -> report
     if "page" not in st.session_state:
         st.session_state.page = "landing"
 
-    # user "freeform 고민" (1단계)
     if "user_problem" not in st.session_state:
         st.session_state.user_problem = ""
 
-    # 분석 결과(2단계) + 사용자가 수정 가능한 설정들
     if "category" not in st.session_state:
         st.session_state.category = TOPIC_CATEGORIES[0][0]
     if "decision_type" not in st.session_state:
@@ -417,12 +426,11 @@ def init_state() -> None:
     if "options" not in st.session_state:
         st.session_state.options = ""
     if "situation" not in st.session_state:
-        st.session_state.situation = ""  # 2단계에서 "상황 설명" 편집용(기본은 user_problem을 복사)
+        st.session_state.situation = ""
 
     if "num_questions" not in st.session_state:
         st.session_state.num_questions = 5
 
-    # 질문 진행 상태
     if "q_index" not in st.session_state:
         st.session_state.q_index = 0
     if "questions" not in st.session_state:
@@ -430,19 +438,19 @@ def init_state() -> None:
     if "answers" not in st.session_state:
         st.session_state.answers = []
 
-    # probe 상태
+    # probe 상태 + 종류(짧음 probe vs 재프레이밍)
     if "probe_active" not in st.session_state:
         st.session_state.probe_active = False
     if "probe_question" not in st.session_state:
         st.session_state.probe_question = ""
     if "probe_for_index" not in st.session_state:
         st.session_state.probe_for_index = None  # type: ignore
+    if "probe_mode" not in st.session_state:
+        st.session_state.probe_mode = ""  # "short" | "reframe" | ""
 
-    # cross-check 사용 기록
     if "crosscheck_used_for" not in st.session_state:
         st.session_state.crosscheck_used_for = set()  # type: ignore
 
-    # 리포트 상태
     if "final_report_json" not in st.session_state:
         st.session_state.final_report_json = None
     if "final_report_raw" not in st.session_state:
@@ -450,11 +458,17 @@ def init_state() -> None:
     if "report_just_entered" not in st.session_state:
         st.session_state.report_just_entered = False
 
-    # 의사결정 매트릭스
     if "decision_matrix_df" not in st.session_state:
         st.session_state.decision_matrix_df = None
 
-    # 디버그
+    # 온보딩 추천 상태(★버그 핵심: 반드시 상태키 존재 + reset에서 초기화)
+    if "onboarding_reco" not in st.session_state:
+        st.session_state.onboarding_reco = None
+    if "onboarding_raw" not in st.session_state:
+        st.session_state.onboarding_raw = None
+    if "onboarding_applied" not in st.session_state:
+        st.session_state.onboarding_applied = False
+
     if "debug_log" not in st.session_state:
         st.session_state.debug_log = []
     if "openai_api_key_input" not in st.session_state:
@@ -463,12 +477,17 @@ def init_state() -> None:
 
 def reset_flow(to_page: str = "landing", keep_problem: bool = False) -> None:
     """
-    keep_problem=True면 user_problem은 유지하고 나머지 흐름을 초기화(사용자 유실 방지 옵션)
+    keep_problem=True면 user_problem은 유지하고 나머지 흐름을 초기화(유실 방지 옵션)
     """
     st.session_state.page = to_page
 
     if not keep_problem:
         st.session_state.user_problem = ""
+
+    # ★ 온보딩 추천 상태 초기화(버그 수정 포인트)
+    st.session_state.onboarding_reco = None
+    st.session_state.onboarding_raw = None
+    st.session_state.onboarding_applied = False
 
     # setup details
     st.session_state.category = TOPIC_CATEGORIES[0][0]
@@ -476,7 +495,7 @@ def reset_flow(to_page: str = "landing", keep_problem: bool = False) -> None:
     st.session_state.coach_id = COACHES[0]["id"]
     st.session_state.goal = ""
     st.session_state.options = ""
-    st.session_state.situation = st.session_state.user_problem or ""
+    st.session_state.situation = (st.session_state.user_problem or "").strip()
 
     st.session_state.num_questions = int(st.session_state.get("num_questions", 5))
 
@@ -487,6 +506,7 @@ def reset_flow(to_page: str = "landing", keep_problem: bool = False) -> None:
     st.session_state.probe_active = False
     st.session_state.probe_question = ""
     st.session_state.probe_for_index = None
+    st.session_state.probe_mode = ""
     st.session_state.crosscheck_used_for = set()
 
     # report
@@ -494,12 +514,20 @@ def reset_flow(to_page: str = "landing", keep_problem: bool = False) -> None:
     st.session_state.final_report_raw = None
     st.session_state.decision_matrix_df = None
     st.session_state.report_just_entered = False
+
     st.session_state.debug_log = []
 
 
-def add_answer(q: str, a: str, kind: str, main_index: int) -> None:
+def add_answer(q: str, a: str, kind: str, main_index: int, subkind: str = "") -> None:
     st.session_state.answers.append(
-        {"q": q, "a": a, "ts": datetime.now().isoformat(timespec="seconds"), "kind": kind, "main_index": main_index}
+        {
+            "q": q,
+            "a": a,
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "kind": kind,  # "main" | "probe"
+            "subkind": subkind,  # "short" | "reframe" | ""
+            "main_index": main_index,
+        }
     )
 
 
@@ -546,6 +574,16 @@ def is_too_short_answer(ans: str) -> bool:
     if len(a) < MIN_ANSWER_CHARS:
         return True
     for pat in SHORT_ANSWER_PATTERNS:
+        if re.search(pat, a):
+            return True
+    return False
+
+
+def is_confused_answer(ans: str) -> bool:
+    a = (ans or "").strip()
+    if not a:
+        return False
+    for pat in CONFUSED_ANSWER_PATTERNS:
         if re.search(pat, a):
             return True
     return False
@@ -598,9 +636,23 @@ def user_prompt_for_onboarding(problem_text: str) -> str:
 
         규칙:
         - 결론/정답/지시/강요 금지
-        - goal_draft는 '사용자가 바꿀 수 있는 초안'임이 자연스럽게 드러나게
+        - goal_draft는 '초안'으로만 제시
         """
     ).strip()
+
+
+def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    t = text.strip()
+    if not t.startswith("{"):
+        m = re.search(r"\{.*\}", t, flags=re.S)
+        if m:
+            t = m.group(0).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        return None
 
 
 def generate_onboarding_recommendation(problem_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str], List[str], Optional[str]]:
@@ -618,7 +670,7 @@ def generate_onboarding_recommendation(problem_text: str) -> Tuple[Optional[Dict
 
 
 # =========================
-# Question generation (기존 유지)
+# Question generation (유지 + 난감 답변 재프레이밍 추가)
 # =========================
 def system_prompt_for_questions(coach: Dict[str, Any]) -> str:
     base = (
@@ -676,6 +728,37 @@ def probing_instruction(last_q: str, last_a: str) -> str:
     ).strip()
 
 
+def reframe_instruction(last_q: str, last_a: str) -> str:
+    """
+    '잘 모르겠어요' 같은 답변이 나왔을 때:
+    - 같은 질문을 더 쉽게 풀어 묻거나
+    - 사용자의 상황에 더 붙은 대체 질문을 1개 생성
+    """
+    return textwrap.dedent(
+        f"""
+        사용자가 질문에 대해 "잘 모르겠어요/감이 안 와요/어려워요" 같은 반응을 보였습니다.
+        아래 정보를 참고해, 사용자의 상황에 맞게 질문을 더 쉽게 풀어 쓰거나(재프레이밍),
+        또는 더 답하기 쉬운 대체 질문 1개를 만들어 주세요.
+
+        [사용자 상황 설명]
+        {st.session_state.situation or "(미입력)"}
+
+        [직전 질문]
+        {last_q}
+
+        [사용자 답변(난감 표현 포함)]
+        {last_a}
+
+        요구사항:
+        - 질문 1개만 출력
+        - 정답/추천/지시/판단 금지
+        - “먼저 A를 하세요” 같은 단계 지시 금지
+        - 답하기 쉬운 형태로:
+          예) 선택지를 제공(둘 중 무엇에 더 가까운지), 예시 요구, 범위 좁히기(이번 주/오늘), 기준 1개만 묻기 등
+        """
+    ).strip()
+
+
 def crosscheck_system_prompt() -> str:
     return (
         "당신은 'AI 결정 코칭 앱'의 논리 충돌 감지기입니다.\n"
@@ -709,26 +792,11 @@ def crosscheck_user_prompt(current_main_index: int) -> str:
         }}
 
         추가 규칙:
-        - question은 질문 1개만(물음표 포함 권장)
+        - question은 질문 1개만
         - 판단/추천/지시/선택 강요 금지
-        - 같은 내용을 반복하지 않게 간결하게
         - current_main_index={current_main_index}
         """
     ).strip()
-
-
-def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
-    if not text:
-        return None
-    t = text.strip()
-    if not t.startswith("{"):
-        m = re.search(r"\{.*\}", t, flags=re.S)
-        if m:
-            t = m.group(0).strip()
-    try:
-        return json.loads(t)
-    except Exception:
-        return None
 
 
 def try_logic_crosscheck_question(main_index: int) -> Tuple[Optional[str], List[str]]:
@@ -925,8 +993,18 @@ def generate_probe_question(last_q: str, last_a: str) -> Tuple[str, Optional[str
     return normalize(q), None, dbg
 
 
+def generate_reframe_question(last_q: str, last_a: str) -> Tuple[str, Optional[str], List[str]]:
+    coach = coach_by_id(st.session_state.coach_id)
+    system = system_prompt_for_questions(coach)
+    user = reframe_instruction(last_q, last_a)
+    q, err, dbg = call_openai_text(system=system, user=user, temperature=0.55)
+    if not q:
+        return "이 질문이 어렵다면, ‘이번 상황에서 가장 신경 쓰이는 한 가지’만 고르면 무엇인가요?", err, dbg
+    return normalize(q), None, dbg
+
+
 # =========================
-# Report generation (기존 유지)
+# Report generation + rendering (동일)
 # =========================
 FORBIDDEN_RECOMMEND_PATTERNS = [
     r"추천",
@@ -1096,9 +1174,6 @@ def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str
     return data, None, dbg, text
 
 
-# =========================
-# Report rendering + matrix + mirroring + export (기존 유지)
-# =========================
 def render_summary_block(data: Dict[str, Any]) -> None:
     s = data.get("summary", {}) or {}
     st.subheader("고민의 핵심 요약")
@@ -1411,7 +1486,7 @@ def build_report_text_for_export(data: Dict[str, Any]) -> str:
 
 
 # =========================
-# Back 버튼 로직(기존 유지)
+# Back 버튼 로직
 # =========================
 def handle_back() -> None:
     if not st.session_state.answers:
@@ -1419,6 +1494,7 @@ def handle_back() -> None:
         st.session_state.probe_active = False
         st.session_state.probe_question = ""
         st.session_state.probe_for_index = None
+        st.session_state.probe_mode = ""
         return
 
     last = st.session_state.answers.pop()
@@ -1427,6 +1503,7 @@ def handle_back() -> None:
         st.session_state.probe_active = False
         st.session_state.probe_question = ""
         st.session_state.probe_for_index = None
+        st.session_state.probe_mode = ""
         st.session_state.q_index = int(last.get("main_index", st.session_state.q_index))
         return
 
@@ -1434,6 +1511,7 @@ def handle_back() -> None:
     st.session_state.probe_active = False
     st.session_state.probe_question = ""
     st.session_state.probe_for_index = None
+    st.session_state.probe_mode = ""
     st.session_state.q_index = max(0, mi)
 
 
@@ -1464,11 +1542,9 @@ with st.sidebar:
 
 
 # =========================
-# Progress Bar indexing (landing/setup 포함)
+# Progress Bar indexing
 # =========================
 nq = int(st.session_state.num_questions)
-
-# labels: Landing, Setup, Q1..Qn, Report
 labels = ["고민", "설정"] + [f"Q{i}" for i in range(1, nq + 1)] + ["요약"]
 
 if st.session_state.page == "landing":
@@ -1476,9 +1552,9 @@ if st.session_state.page == "landing":
 elif st.session_state.page == "setup_details":
     idx = 1
 elif st.session_state.page == "questions":
-    idx = 2 + int(st.session_state.q_index)  # Q1 위치가 2
+    idx = 2 + int(st.session_state.q_index)
 else:
-    idx = 2 + nq  # report
+    idx = 2 + nq
 
 render_pebble_bridge(idx, len(labels), labels)
 progress = idx / max(1, (len(labels) - 1))
@@ -1498,7 +1574,7 @@ def render_landing() -> None:
     cols = st.columns([1, 3, 1])
     with cols[1]:
         st.subheader("1단계 · 고민 작성")
-        st.caption("지금 고민 중인 상황을 자유롭게 적어주세요. (짧아도 괜찮아요)")
+        st.caption("지금 고민 중인 상황을 자유롭게 적어주세요.")
 
         with st.container(border=True):
             st.text_area(
@@ -1518,7 +1594,6 @@ def render_landing() -> None:
                 if not txt:
                     st.warning("고민 내용을 먼저 한 줄이라도 적어주세요.")
                 else:
-                    # 2단계에서 편집용 situation 기본값으로 복사(유실 방지)
                     if not (st.session_state.situation or "").strip():
                         st.session_state.situation = txt
                     st.session_state.page = "setup_details"
@@ -1531,13 +1606,8 @@ def render_setup_details() -> None:
 
     problem_text = (st.session_state.user_problem or "").strip()
 
-    # AI 추천 생성 버튼(자동 1회)
-    if "onboarding_reco" not in st.session_state:
-        st.session_state.onboarding_reco = None
-    if "onboarding_raw" not in st.session_state:
-        st.session_state.onboarding_raw = None
-
-    auto_generate = st.session_state.onboarding_reco is None and problem_text
+    # 자동 1회 생성: onboarding_reco가 None이면 생성
+    auto_generate = st.session_state.onboarding_reco is None and bool(problem_text)
     if auto_generate:
         with st.spinner("AI가 고민을 읽고 추천을 만드는 중..."):
             reco, err, dbg, raw = generate_onboarding_recommendation(problem_text)
@@ -1557,6 +1627,7 @@ def render_setup_details() -> None:
                 st.session_state.debug_log = dbg
                 st.session_state.onboarding_reco = reco
                 st.session_state.onboarding_raw = raw
+                st.session_state.onboarding_applied = False  # 다시 적용 가능하게
                 if err:
                     st.warning(err)
             st.rerun()
@@ -1565,12 +1636,9 @@ def render_setup_details() -> None:
         st.write(problem_text)
 
     reco = st.session_state.onboarding_reco or {}
-    # 추천값 반영(초기 1회: 사용자가 이미 수정했다면 덮어쓰지 않도록)
-    if "onboarding_applied" not in st.session_state:
-        st.session_state.onboarding_applied = False
 
+    # 추천값 반영(초기 1회만, 사용자 수정 보호)
     if reco and not st.session_state.onboarding_applied:
-        # category
         rec_cat = reco.get("recommended_category", "")
         if rec_cat in [c[0] for c in TOPIC_CATEGORIES]:
             st.session_state.category = rec_cat
@@ -1586,6 +1654,9 @@ def render_setup_details() -> None:
         goal_draft = str(reco.get("goal_draft", "") or "").strip()
         if goal_draft and not (st.session_state.goal or "").strip():
             st.session_state.goal = goal_draft
+
+        if not (st.session_state.situation or "").strip():
+            st.session_state.situation = problem_text
 
         st.session_state.onboarding_applied = True
 
@@ -1609,6 +1680,7 @@ def render_setup_details() -> None:
         reason = str(reco.get("coach_reason", "") or "").strip()
         if reason:
             st.info(f"**AI가 이 코치를 추천한 이유(참고):** {reason}")
+
         with st.expander("코치 진행 방식"):
             st.markdown(f"**{coach['name']}**  \n_{coach['style']}_")
             for m in coach["method"]:
@@ -1619,7 +1691,6 @@ def render_setup_details() -> None:
     st.caption("기본값은 1단계에서 적은 고민입니다. 필요하면 다듬어주세요.")
     st.text_area("상황 설명", key="situation", height=180)
 
-    # 결정 유형 템플릿(원하면 삽입)
     with st.expander("결정 유형 가이드(템플릿)"):
         st.caption("필요하면 아래 가이드를 상황 설명에 삽입할 수 있어요.")
         tmpl = DECISION_TEMPLATES.get(st.session_state.decision_type, "")
@@ -1627,10 +1698,7 @@ def render_setup_details() -> None:
             st.code(tmpl, language="text")
             if st.button("가이드 삽입(상황 설명에 추가)", use_container_width=True):
                 cur_txt = (st.session_state.situation or "").strip()
-                if not cur_txt:
-                    st.session_state.situation = tmpl
-                else:
-                    st.session_state.situation = cur_txt + "\n\n" + tmpl
+                st.session_state.situation = (cur_txt + "\n\n" + tmpl).strip() if cur_txt else tmpl
                 st.rerun()
 
     st.divider()
@@ -1647,13 +1715,13 @@ def render_setup_details() -> None:
                 st.caption("추천 원문이 아직 없습니다.")
     with b3:
         if st.button("코칭 시작하기(실행하기)", type="primary", use_container_width=True):
-            # 질문 세션 시작: 기존 흐름 초기화(고민 내용은 유지)
             st.session_state.q_index = 0
             st.session_state.questions = []
             st.session_state.answers = []
             st.session_state.probe_active = False
             st.session_state.probe_question = ""
             st.session_state.probe_for_index = None
+            st.session_state.probe_mode = ""
             st.session_state.crosscheck_used_for = set()
             st.session_state.final_report_json = None
             st.session_state.final_report_raw = None
@@ -1664,7 +1732,7 @@ def render_setup_details() -> None:
 
 def render_questions() -> None:
     st.title("질문")
-    st.caption("한 화면에 한 질문. 답변이 10자 미만이면 1회 구체화 질문을 합니다.")
+    st.caption("한 화면에 한 질문. 답변이 10자 미만이면 구체화 질문, '잘 모르겠어요'면 재프레이밍 질문을 1회 제공합니다.")
 
     nq = int(st.session_state.num_questions)
     q_idx = int(st.session_state.q_index)
@@ -1676,7 +1744,10 @@ def render_questions() -> None:
     if st.session_state.probe_active and st.session_state.probe_for_index == q_idx:
         show_q = st.session_state.probe_question
         kind = "probe"
-        badge = "추가 질문(구체화)"
+        if st.session_state.probe_mode == "reframe":
+            badge = "도움 질문(재프레이밍)"
+        else:
+            badge = "추가 질문(구체화)"
     else:
         show_q = main_q
         kind = "main"
@@ -1707,27 +1778,46 @@ def render_questions() -> None:
         if not a:
             st.warning("답변이 비어 있습니다. 한 줄만 입력해도 진행 가능합니다.")
         else:
-            add_answer(show_q, a, kind=kind, main_index=q_idx)
-
             if kind == "probe":
+                add_answer(show_q, a, kind="probe", main_index=q_idx, subkind=st.session_state.probe_mode or "")
+                # probe 끝 -> 다음 main으로
                 st.session_state.probe_active = False
                 st.session_state.probe_question = ""
                 st.session_state.probe_for_index = None
+                st.session_state.probe_mode = ""
                 st.session_state.q_index = min(q_idx + 1, nq - 1)
+                st.rerun()
+
+            # main answer 저장
+            add_answer(show_q, a, kind="main", main_index=q_idx, subkind="")
+
+            # 1) 난감 답변이면: 재프레이밍 질문 1회 제공(다음 단계로 안 넘어감)
+            if is_confused_answer(a):
+                rq, err, dbg = generate_reframe_question(show_q, a)
+                st.session_state.debug_log = dbg
+                st.session_state.probe_active = True
+                st.session_state.probe_question = rq
+                st.session_state.probe_for_index = q_idx
+                st.session_state.probe_mode = "reframe"
+                st.rerun()
+
+            # 2) 짧은 답변이면: 구체화 질문 1회 제공
+            if is_too_short_answer(a):
+                pq, err, dbg = generate_probe_question(show_q, a)
+                st.session_state.debug_log = dbg
+                st.session_state.probe_active = True
+                st.session_state.probe_question = pq
+                st.session_state.probe_for_index = q_idx
+                st.session_state.probe_mode = "short"
+                st.rerun()
+
+            # 3) 정상 진행
+            if main_answer_count() >= nq:
+                st.session_state.page = "report"
+                st.session_state.report_just_entered = True
+                st.session_state.q_index = nq - 1
             else:
-                if is_too_short_answer(a):
-                    pq, err, dbg = generate_probe_question(show_q, a)
-                    st.session_state.debug_log = dbg
-                    st.session_state.probe_active = True
-                    st.session_state.probe_question = pq
-                    st.session_state.probe_for_index = q_idx
-                else:
-                    if main_answer_count() >= nq:
-                        st.session_state.page = "report"
-                        st.session_state.report_just_entered = True
-                        st.session_state.q_index = nq - 1
-                    else:
-                        st.session_state.q_index = min(q_idx + 1, nq - 1)
+                st.session_state.q_index = min(q_idx + 1, nq - 1)
             st.rerun()
 
     with st.expander("답변 기록"):
@@ -1739,7 +1829,9 @@ def render_questions() -> None:
             st.markdown(f"### Q{mi + 1}")
             for qa in grouped[mi]:
                 tag = "PROBE" if qa.get("kind") == "probe" else "MAIN"
-                st.markdown(f"**({tag}) {qa['q']}**")
+                sub = qa.get("subkind", "")
+                tag2 = f"{tag}:{sub}" if sub else tag
+                st.markdown(f"**({tag2}) {qa['q']}**")
                 st.write(qa["a"])
                 st.caption(qa["ts"])
                 st.divider()
