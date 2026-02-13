@@ -17,11 +17,18 @@
 # - 결정 유형별 템플릿(2단계에서 상황설명 가이드 삽입 버튼)
 # - 리포트: 의사결정 매트릭스(st.data_editor), Mirroring 시각화, 복사/다운로드, 유효기간, balloons
 #
-# 이번 수정(버그 + 기능):
-# 1) "처음부터 다시 하기" 후 2단계 AI 분석이 초기화되지 않는 문제 해결
-#    -> reset_flow에서 onboarding_* 상태(onboarding_reco/raw/applied)까지 명확히 초기화
-# 2) 질문 과정에서 "모르겠/감이 안 와" 등 난감 답변 시,
-#    -> 다음으로 넘어가지 않고 ‘상황을 반영한’ 재프레이밍/대체 질문을 1회 추가 생성
+# 이번 반영(추가 기능 + 개선):
+# 1) “모순/긴장 지도” 시각화(리포트)
+# 2) “정보 부족 체크리스트”(질문 형태 1~3개, 리포트)
+# 3) “세션 템플릿 저장/불러오기”(프리셋)
+# 4) “감정 변화 트래킹(셀프 체크)” (질문 시작 전/리포트에서)
+# 5) “다음 세션 연결 질문”(리포트 next_self_question 답변 → 새 세션 시작)
+# 6) “프라이버시 모드”(답변 기록 숨기기 + 내보내기 마스킹 + 일부 화면 가림)
+# 7) crosscheck_used_for: set() → list 저장(세션 직렬화 안정)
+# 8) 난감 답변 트리거 정교화(“난감 키워드 + 정보 부족”일 때만)
+# 9) JSON 파싱 robustness 강화(후보 여러 개 추출 후 첫 성공)
+# 10) 금칙어 탐지 정밀도 개선(“추천” 단독 제거, 문장 패턴 중심)
+# 11) 온보딩/리포트: LLM 실패 시 규칙 기반 fallback JSON 생성(UX 안정)
 #
 # 필요:
 #   pip install streamlit openai pandas
@@ -162,18 +169,16 @@ COACHES = [
 # Probing 기준: 10자 미만이면 1회 추가 질문
 MIN_ANSWER_CHARS = 10
 
-# "난감/모름" 답변 패턴(길이와 무관하게 트리거)
+# 난감 키워드(“모르겠/감이 안 와” 등)
 CONFUSED_ANSWER_PATTERNS = [
     r"모르겠",
     r"잘\s*모르",
     r"감이\s*안",
     r"생각이\s*안",
     r"어렵",
-    r"잘\s*모르겠",
-    r"모르겠어요",
 ]
 
-# 짧은 답변 판단(기존 probing)
+# “짧은/회피” 답변 패턴(기존 probing)
 SHORT_ANSWER_PATTERNS = [
     r"^모르겠",
     r"^잘\s*모르",
@@ -351,6 +356,7 @@ def call_openai_text(system: str, user: str, temperature: float = 0.6) -> Tuple[
     except Exception as e:
         return None, str(e), debug
 
+    # Responses API 우선
     if hasattr(client, "responses"):
         for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
             try:
@@ -378,6 +384,7 @@ def call_openai_text(system: str, user: str, temperature: float = 0.6) -> Tuple[
             except Exception as e:
                 debug.append(f"Responses failed: {type(e).__name__}: {e}")
 
+    # Chat Completions fallback
     for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
         try:
             debug.append(f"Chat Completions / model={model}")
@@ -448,8 +455,9 @@ def init_state() -> None:
     if "probe_mode" not in st.session_state:
         st.session_state.probe_mode = ""  # "short" | "reframe" | ""
 
+    # ★ 세션 직렬화 안정: set() 대신 list 저장
     if "crosscheck_used_for" not in st.session_state:
-        st.session_state.crosscheck_used_for = set()  # type: ignore
+        st.session_state.crosscheck_used_for = []  # list[int]
 
     if "final_report_json" not in st.session_state:
         st.session_state.final_report_json = None
@@ -461,13 +469,31 @@ def init_state() -> None:
     if "decision_matrix_df" not in st.session_state:
         st.session_state.decision_matrix_df = None
 
-    # 온보딩 추천 상태(★버그 핵심: 반드시 상태키 존재 + reset에서 초기화)
+    # 온보딩 추천 상태
     if "onboarding_reco" not in st.session_state:
         st.session_state.onboarding_reco = None
     if "onboarding_raw" not in st.session_state:
         st.session_state.onboarding_raw = None
     if "onboarding_applied" not in st.session_state:
         st.session_state.onboarding_applied = False
+
+    # 프리셋(세션 템플릿)
+    if "saved_templates" not in st.session_state:
+        st.session_state.saved_templates = []  # list[dict]
+
+    # 감정 트래킹(셀프 체크)
+    if "emotion_pre" not in st.session_state:
+        st.session_state.emotion_pre = None
+    if "emotion_post" not in st.session_state:
+        st.session_state.emotion_post = None
+
+    # 프라이버시 모드
+    if "privacy_mode" not in st.session_state:
+        st.session_state.privacy_mode = False
+    if "hide_history" not in st.session_state:
+        st.session_state.hide_history = False
+    if "mask_export" not in st.session_state:
+        st.session_state.mask_export = True
 
     if "debug_log" not in st.session_state:
         st.session_state.debug_log = []
@@ -484,7 +510,7 @@ def reset_flow(to_page: str = "landing", keep_problem: bool = False) -> None:
     if not keep_problem:
         st.session_state.user_problem = ""
 
-    # ★ 온보딩 추천 상태 초기화(버그 수정 포인트)
+    # 온보딩 추천 상태 초기화
     st.session_state.onboarding_reco = None
     st.session_state.onboarding_raw = None
     st.session_state.onboarding_applied = False
@@ -507,13 +533,17 @@ def reset_flow(to_page: str = "landing", keep_problem: bool = False) -> None:
     st.session_state.probe_question = ""
     st.session_state.probe_for_index = None
     st.session_state.probe_mode = ""
-    st.session_state.crosscheck_used_for = set()
+    st.session_state.crosscheck_used_for = []  # list로 초기화
 
     # report
     st.session_state.final_report_json = None
     st.session_state.final_report_raw = None
     st.session_state.decision_matrix_df = None
     st.session_state.report_just_entered = False
+
+    # emotion
+    st.session_state.emotion_pre = None
+    st.session_state.emotion_post = None
 
     st.session_state.debug_log = []
 
@@ -579,18 +609,134 @@ def is_too_short_answer(ans: str) -> bool:
     return False
 
 
+def _has_meaningful_content(ans: str) -> bool:
+    """
+    난감 키워드가 있어도, 실제로는 꽤 많은 구체 정보가 담긴 경우가 있음.
+    - ‘난감 키워드 + 정보 부족’일 때만 재프레이밍을 트리거하기 위한 보조 함수.
+    """
+    a = normalize(ans)
+    if not a:
+        return False
+
+    # 숫자/기간/고유명/옵션(A,B 등) 같은 “정보성” 신호가 있으면 의미 있는 내용으로 간주
+    signals = 0
+    if re.search(r"\d", a):
+        signals += 1
+    if re.search(r"(이번\s*주|다음\s*주|이번\s*달|올해|내년|오늘|내일|어제|주말)", a):
+        signals += 1
+    if re.search(r"(A|B|C)\s*(안|을|를)?", a):
+        signals += 1
+    if len(a) >= 35:
+        signals += 1
+    # 쉼표/줄바꿈 등 나열 구조도 정보성 신호
+    if a.count(",") >= 2:
+        signals += 1
+
+    return signals >= 2
+
+
 def is_confused_answer(ans: str) -> bool:
+    """
+    개선: “난감 키워드”가 있더라도 정보가 충분하면 재프레이밍을 강제하지 않음.
+    즉, (난감 키워드) AND (짧거나 정보 부족)일 때만 True.
+    """
     a = (ans or "").strip()
     if not a:
         return False
-    for pat in CONFUSED_ANSWER_PATTERNS:
-        if re.search(pat, a):
-            return True
+
+    has_confused_kw = any(re.search(pat, a) for pat in CONFUSED_ANSWER_PATTERNS)
+    if not has_confused_kw:
+        return False
+
+    # 짧거나 정보가 부족할 때만 난감 처리
+    if is_too_short_answer(a):
+        return True
+    if not _has_meaningful_content(a):
+        return True
     return False
 
 
 def parse_options() -> List[str]:
     return [o.strip() for o in (st.session_state.options or "").split(",") if o.strip()]
+
+
+def mask_text_for_privacy(text: str) -> str:
+    """
+    프라이버시 모드 내보내기 마스킹:
+    - 이메일, 전화/숫자열(길게), URL 비슷한 것, 날짜/시간 일부 마스킹
+    - 완벽한 익명화가 아니라 “공유 위험 낮추기” 목적
+    """
+    t = text or ""
+    t = re.sub(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", "[이메일]", t)
+    t = re.sub(r"(https?://\S+)", "[링크]", t)
+    # 길게 이어진 숫자(계좌/전화 등 가능)
+    t = re.sub(r"\b\d{6,}\b", "[숫자]", t)
+    # 날짜 형태 일부
+    t = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "[날짜]", t)
+    # 시간 형태 일부
+    t = re.sub(r"\b\d{1,2}:\d{2}(:\d{2})?\b", "[시간]", t)
+    return t
+
+
+# =========================
+# JSON parsing robustness
+# =========================
+def extract_json_candidates(text: str) -> List[str]:
+    """
+    중괄호 균형 스캔으로 JSON 후보들을 추출.
+    - 모델이 JSON 앞뒤로 설명을 붙이거나
+    - 중괄호 블록이 여러 개인 경우를 견딤
+    """
+    if not text:
+        return []
+    s = text.strip()
+
+    candidates: List[str] = []
+    stack = 0
+    start = None
+
+    for i, ch in enumerate(s):
+        if ch == "{":
+            if stack == 0:
+                start = i
+            stack += 1
+        elif ch == "}":
+            if stack > 0:
+                stack -= 1
+                if stack == 0 and start is not None:
+                    block = s[start : i + 1].strip()
+                    if len(block) >= 2:
+                        candidates.append(block)
+                    start = None
+
+    # 가장 큰 블록을 우선(대개 최종 JSON)
+    candidates = sorted(set(candidates), key=len, reverse=True)
+    return candidates
+
+
+def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
+    if not text:
+        return None
+    raw = text.strip()
+
+    # 1) 통으로 파싱 시도
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+
+    # 2) 후보 블록들 중 첫 성공 사용
+    for cand in extract_json_candidates(raw):
+        try:
+            obj = json.loads(cand)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            continue
+
+    return None
 
 
 # =========================
@@ -641,18 +787,36 @@ def user_prompt_for_onboarding(problem_text: str) -> str:
     ).strip()
 
 
-def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
-    if not text:
-        return None
-    t = text.strip()
-    if not t.startswith("{"):
-        m = re.search(r"\{.*\}", t, flags=re.S)
-        if m:
-            t = m.group(0).strip()
-    try:
-        return json.loads(t)
-    except Exception:
-        return None
+def onboarding_fallback(problem_text: str) -> Dict[str, Any]:
+    # 아주 보수적인 규칙 기반 초안
+    txt = normalize(problem_text)
+    cat = "📦 기타"
+    if any(k in txt for k in ["취업", "이직", "진로", "전공", "학업", "대학원"]):
+        cat = "🎓 학업/진로"
+    elif any(k in txt for k in ["프로젝트", "업무", "팀", "회사", "리더", "성과", "커리어"]):
+        cat = "💼 커리어/일"
+    elif any(k in txt for k in ["연인", "친구", "가족", "갈등", "관계", "대화"]):
+        cat = "💖 관계"
+    elif any(k in txt for k in ["돈", "예산", "소비", "저축", "투자", "구매"]):
+        cat = "💰 돈/소비"
+    elif any(k in txt for k in ["불안", "번아웃", "우울", "스트레스", "마음", "삶"]):
+        cat = "🧠 마음/삶"
+
+    dtype = "해야 할지 말지(Yes/No)" if any(k in txt for k in ["할까", "말까", "해야", "그만", "시작"]) else "여러 옵션 중 선택"
+    coach_id = "logic"
+    if any(k in txt for k in ["불안", "후회", "감정", "마음", "관계"]):
+        coach_id = "value"
+    if any(k in txt for k in ["계획", "실행", "루틴", "습관", "일정", "공부법"]):
+        coach_id = "action"
+
+    return {
+        "recommended_category": cat,
+        "recommended_decision_type": dtype,
+        "recommended_coach_id": coach_id,
+        "coach_reason": "사용자가 말한 고민에서 ‘정리/기준/감정/실행’ 중 무엇이 두드러지는지에 맞춘 초안입니다.",
+        "goal_draft": "지금 고민에서 내가 중요하게 여기는 기준과 감당 가능한 리스크를 더 선명하게 적어보고 싶다(초안).",
+        "options_hint": "지금 떠오르는 선택지/가능성(있다면)을 쉼표로 2~4개만 적어볼 수 있을까요?",
+    }
 
 
 def generate_onboarding_recommendation(problem_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str], List[str], Optional[str]]:
@@ -660,17 +824,22 @@ def generate_onboarding_recommendation(problem_text: str) -> Tuple[Optional[Dict
     user = user_prompt_for_onboarding(problem_text)
     txt, err, dbg = call_openai_text(system=system, user=user, temperature=0.2)
     if not txt:
-        return None, err, dbg, None
+        # fallback
+        fb = onboarding_fallback(problem_text)
+        dbg.append("Onboarding fallback used (no model output).")
+        return fb, err, dbg, None
 
     data = safe_json_parse(txt)
     if not data:
-        return None, "온보딩 추천 JSON 파싱 실패", dbg, txt
+        fb = onboarding_fallback(problem_text)
+        dbg.append("Onboarding fallback used (JSON parse fail).")
+        return fb, "온보딩 추천 JSON 파싱 실패(대체 초안을 표시합니다)", dbg, txt
 
     return data, None, dbg, txt
 
 
 # =========================
-# Question generation (유지 + 난감 답변 재프레이밍 추가)
+# Question generation
 # =========================
 def system_prompt_for_questions(coach: Dict[str, Any]) -> str:
     base = (
@@ -729,11 +898,6 @@ def probing_instruction(last_q: str, last_a: str) -> str:
 
 
 def reframe_instruction(last_q: str, last_a: str) -> str:
-    """
-    '잘 모르겠어요' 같은 답변이 나왔을 때:
-    - 같은 질문을 더 쉽게 풀어 묻거나
-    - 사용자의 상황에 더 붙은 대체 질문을 1개 생성
-    """
     return textwrap.dedent(
         f"""
         사용자가 질문에 대해 "잘 모르겠어요/감이 안 와요/어려워요" 같은 반응을 보였습니다.
@@ -801,7 +965,9 @@ def crosscheck_user_prompt(current_main_index: int) -> str:
 
 def try_logic_crosscheck_question(main_index: int) -> Tuple[Optional[str], List[str]]:
     dbg: List[str] = []
-    if main_index in st.session_state.crosscheck_used_for:
+    used_set = set(int(x) for x in (st.session_state.crosscheck_used_for or []))
+
+    if main_index in used_set:
         return None, dbg
 
     mains = [x for x in st.session_state.answers if x.get("kind") == "main"]
@@ -825,7 +991,9 @@ def try_logic_crosscheck_question(main_index: int) -> Tuple[Optional[str], List[
     has_conflict = bool(data.get("has_conflict", False))
     q = normalize(str(data.get("question", "") or ""))
 
-    st.session_state.crosscheck_used_for.add(main_index)
+    # list로 저장
+    used_set.add(main_index)
+    st.session_state.crosscheck_used_for = sorted(list(used_set))
 
     if has_conflict and q:
         dbg.append("Crosscheck conflict detected -> using conflict question.")
@@ -934,10 +1102,10 @@ def generate_question(i: int, n: int) -> Tuple[str, Optional[str], List[str]]:
     dbg_acc: List[str] = cross_dbg[:]
 
     def prompt(nonce: int) -> str:
-        prev_txt = "\n".join([f"- {q}" for q in prev_qs]) if prev_qs else "(없음)"
+        prev_txt = "\n".join([f"- {q}" for q in prev_qs[-6:]]) if prev_qs else "(없음)"
         return textwrap.dedent(
             f"""
-            [이전 질문 목록]
+            [최근 질문 목록]
             {prev_txt}
 
             {build_context_block()}
@@ -1004,18 +1172,22 @@ def generate_reframe_question(last_q: str, last_a: str) -> Tuple[str, Optional[s
 
 
 # =========================
-# Report generation + rendering (동일)
+# Report generation + rendering
 # =========================
+# 금칙어(추천/지시) 탐지 정밀도 개선: “추천” 단독 제거, 문장 패턴 중심
 FORBIDDEN_RECOMMEND_PATTERNS = [
-    r"추천",
+    r"추천합니다",
+    r"추천드",
     r"~?하는 것이 좋",
+    r"~?하는 게 좋",
+    r"~?하시면 좋",
     r"해야 합니다",
     r"하시길",
     r"하는 게 낫",
-    r"A를 선택",
-    r"B를 선택",
-    r"정답",
-    r"결론",
+    r"정답(은|:)",
+    r"결론(은|:)",
+    r"\bA를\s*선택",
+    r"\bB를\s*선택",
 ]
 
 
@@ -1032,11 +1204,18 @@ def report_schema_hint(coach_id: str) -> str:
 반드시 JSON만 출력하세요(코드블록/설명 금지).
 절대 추천/결론/정답/지시를 하지 마세요.
 coaching_message는 반드시 "거울 비추기(Mirroring)" 화법만 사용하세요.
-금지 표현: "추천", "좋겠습니다", "해야 합니다", "하자", "정답", "결론", "A를 선택".
+금지 표현: "추천합니다", "좋겠습니다", "해야 합니다", "하자", "정답", "결론", "A를 선택".
 """
+
+    common_extra = """
+추가 필드(원칙 유지):
+- "info_check_questions": ["string", ...]  # ‘추가로 확인하면’ 결정을 가볍게 하는 질문 1~3개(질문 형태만)
+"""
+
     if coach_id == "action":
         return textwrap.dedent(
             base
+            + common_extra
             + """
 JSON 스키마:
 {
@@ -1058,6 +1237,7 @@ JSON 스키마:
     "Mon": ["string"], "Tue": ["string"], "Wed": ["string"], "Thu": ["string"],
     "Fri": ["string"], "Sat": ["string"], "Sun": ["string"]
   },
+  "info_check_questions": ["string"],
   "coaching_message": ["string","string"],
   "next_self_question": "string"
 }
@@ -1067,6 +1247,7 @@ JSON 스키마:
     if coach_id == "logic":
         return textwrap.dedent(
             base
+            + common_extra
             + """
 JSON 스키마:
 {
@@ -1078,6 +1259,7 @@ JSON 스키마:
   },
   "criteria": [{"name":"string","priority":1-5,"why":"string"}],
   "key_points": {"uncertainties":["string"], "tradeoffs":["string"]},
+  "info_check_questions": ["string"],
   "coaching_message":["string","string"],
   "next_self_question":"string"
 }
@@ -1086,6 +1268,7 @@ JSON 스키마:
 
     return textwrap.dedent(
         base
+        + common_extra
         + """
 JSON 스키마:
 {
@@ -1097,6 +1280,7 @@ JSON 스키마:
   },
   "criteria": [{"name":"string","priority":1-5,"why":"string"}],
   "emotions_values": {"emotions":["string","string"], "top_values":["string","string","string"]},
+  "info_check_questions": ["string"],
   "coaching_message":["string","string"],
   "next_self_question":"string"
 }
@@ -1120,6 +1304,37 @@ def build_qa_text_for_report() -> str:
         tag = "PROBE" if qa.get("kind") == "probe" else "MAIN"
         qa_text += f"{i}) ({tag}) Q: {qa['q']}\n   A: {qa['a']}\n"
     return qa_text
+
+
+def fallback_report_json() -> Dict[str, Any]:
+    coach = coach_by_id(st.session_state.coach_id)
+    opts = parse_options()
+    base = {
+        "summary": {
+            "core_issue": normalize(st.session_state.situation)[:180] or "핵심 고민이 요약되지 않았습니다.",
+            "goal": normalize(st.session_state.goal)[:180] or "목표가 명확히 적히지 않았습니다.",
+            "constraints": [],
+            "options_mentioned": opts or [],
+        },
+        "criteria": [],
+        "info_check_questions": [
+            "이 결정을 더 가볍게 만들기 위해, 지금 ‘확인되지 않은 사실/가정’은 무엇인가요?",
+            "최악의 경우를 상상했을 때, 실제로 감당 가능한 비용/손실의 범위는 어느 정도인가요?",
+        ],
+        "coaching_message": [
+            "지금은 ‘정리’가 필요하다는 느낌과, 동시에 ‘확신이 부족하다’는 느낌이 함께 있는 상태처럼 보입니다.",
+            "당신에게 중요한 기준이 무엇인지가 선명해질수록, 선택이 덜 무겁게 느껴질 가능성이 있어요.",
+        ],
+        "next_self_question": "내가 지금 가장 놓치기 싫은 기준 1개는 무엇이고, 왜 그것이 중요한가요?",
+    }
+    if coach["id"] == "logic":
+        base["key_points"] = {"uncertainties": [], "tradeoffs": []}
+    elif coach["id"] == "action":
+        base["plan_visualization"] = {"year": "", "month": "", "week": []}
+        base["weekly_table"] = {"Mon": [], "Tue": [], "Wed": [], "Thu": [], "Fri": [], "Sat": [], "Sun": []}
+    else:
+        base["emotions_values"] = {"emotions": [], "top_values": []}
+    return base
 
 
 def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str], List[str], Optional[str]]:
@@ -1147,16 +1362,21 @@ def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str
 - 추천/결론/정답/지시 금지
 - coaching_message는 거울 비추기만
 - 사용자가 말하지 않은 계획을 ‘지어내지’ 마세요
+- info_check_questions는 질문 형태로 1~3개만
 """
     ).strip()
 
     text, err, dbg = call_openai_text(system=system, user=user, temperature=0.25)
     if not text:
-        return None, err, dbg, None
+        fb = fallback_report_json()
+        dbg.append("Report fallback used (no model output).")
+        return fb, err, dbg, None
 
     data = safe_json_parse(text)
     if data is None:
-        return None, "리포트 JSON 파싱 실패(모델이 JSON만 출력하지 않았을 수 있음)", dbg, text
+        fb = fallback_report_json()
+        dbg.append("Report fallback used (JSON parse fail).")
+        return fb, "리포트 JSON 파싱 실패(대체 정리를 표시합니다)", dbg, text
 
     combined = json.dumps(data, ensure_ascii=False)
     if contains_forbidden_recommendation(combined):
@@ -1262,6 +1482,128 @@ def render_emotions_values(data: Dict[str, Any]) -> None:
     with c2:
         st.write("**가치 Top3**")
         for x in ev.get("top_values", []) or []:
+            st.write(f"- {x}")
+
+
+def render_info_check_questions(data: Dict[str, Any]) -> None:
+    st.subheader("정보 부족 체크리스트(질문 형태)")
+    qs = data.get("info_check_questions", []) or []
+    qs = [str(x).strip() for x in qs if str(x).strip()]
+    if not qs:
+        st.caption("추가로 확인할 질문이 충분히 드러나지 않았어요.")
+        return
+    for q in qs[:3]:
+        # 질문 형태 유지(추천/지시 금지)
+        st.write(f"- {q}")
+
+
+# ---- “모순/긴장 지도” 시각화(원칙 유지) ----
+TENSION_AXES = [
+    ("안정", "성장"),
+    ("자유", "안정"),
+    ("돈", "시간"),
+    ("속도", "완성도"),
+    ("성과", "건강"),
+    ("관계", "경계"),
+    ("도전", "안정"),
+    ("단기", "장기"),
+]
+
+
+def _collect_tension_signals(data: Dict[str, Any]) -> Dict[str, str]:
+    """
+    리포트 기반으로 ‘신호 텍스트’를 모아 간단 매칭용 텍스트로 반환
+    """
+    s = data.get("summary", {}) or {}
+    crit = data.get("criteria", []) or []
+    crit_text = " ".join([str(c.get("name", "")) + " " + str(c.get("why", "")) for c in crit if isinstance(c, dict)])
+    core = str(s.get("core_issue", "") or "")
+    goal = str(s.get("goal", "") or "")
+
+    extras = ""
+    if "key_points" in data:
+        kp = data.get("key_points", {}) or {}
+        extras += " " + " ".join(kp.get("uncertainties", []) or [])
+        extras += " " + " ".join(kp.get("tradeoffs", []) or [])
+    if "emotions_values" in data:
+        ev = data.get("emotions_values", {}) or {}
+        extras += " " + " ".join(ev.get("emotions", []) or [])
+        extras += " " + " ".join(ev.get("top_values", []) or [])
+
+    blob = normalize(" ".join([core, goal, crit_text, extras]))
+    return {"blob": blob, "core": core, "goal": goal, "crit": crit_text, "extras": extras}
+
+
+def render_tension_map(data: Dict[str, Any]) -> None:
+    st.subheader("모순/긴장 지도(관찰용)")
+    st.caption("결론을 내기 위한 게 아니라, ‘내 안의 기준들이 어디에서 서로 당기는지’를 한 번 더 보려는 지도예요.")
+
+    sig = _collect_tension_signals(data)
+    blob = sig["blob"]
+
+    # 1) 축 감지
+    found_axes = []
+    for a, b in TENSION_AXES:
+        if (a in blob) and (b in blob):
+            found_axes.append((a, b))
+
+    # 2) 기준 Top3 + 불확실/트레이드오프 + 감정어(미러링에서 가져오는 건 별도이므로 여기선 리포트만)
+    crit = data.get("criteria", []) or []
+    crit_sorted = []
+    for c in crit:
+        try:
+            p = int(c.get("priority", 999))
+        except Exception:
+            p = 999
+        crit_sorted.append((p, str(c.get("name", "") or "").strip()))
+    crit_sorted = [x for x in sorted(crit_sorted, key=lambda x: x[0]) if x[1]]
+    top3 = [x[1] for x in crit_sorted[:3]]
+
+    uncertainties = []
+    tradeoffs = []
+    if "key_points" in data:
+        kp = data.get("key_points", {}) or {}
+        uncertainties = [str(x).strip() for x in (kp.get("uncertainties", []) or []) if str(x).strip()]
+        tradeoffs = [str(x).strip() for x in (kp.get("tradeoffs", []) or []) if str(x).strip()]
+
+    emotions = []
+    if "emotions_values" in data:
+        ev = data.get("emotions_values", {}) or {}
+        emotions = [str(x).strip() for x in (ev.get("emotions", []) or []) if str(x).strip()]
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.write("**기준 Top3(우선순위 기준)**")
+        if top3:
+            for x in top3:
+                st.write(f"- {x}")
+        else:
+            st.caption("기준 Top3가 충분히 드러나지 않았어요.")
+    with c2:
+        st.write("**불확실/리스크 신호**")
+        if uncertainties:
+            for x in uncertainties[:4]:
+                st.write(f"- {x}")
+        else:
+            st.caption("불확실 신호가 충분히 드러나지 않았어요.")
+    with c3:
+        st.write("**감정 신호(리포트 기반)**")
+        if emotions:
+            for x in emotions[:4]:
+                st.write(f"- {x}")
+        else:
+            st.caption("감정 신호가 충분히 드러나지 않았어요.")
+
+    st.write("**긴장 축(텍스트 매칭 기반)**")
+    if found_axes:
+        for a, b in found_axes:
+            st.write(f"- {a} ↔ {b}")
+    else:
+        st.caption("명확한 ‘긴장 축’이 자동으로 잡히지 않았어요. (기준/불확실/감정에서 키워드가 다르게 표현됐을 수 있어요.)")
+
+    if tradeoffs:
+        st.write("**사용자가 말한 트레이드오프(리포트 기반)**")
+        for x in tradeoffs[:5]:
             st.write(f"- {x}")
 
 
@@ -1471,6 +1813,8 @@ def build_report_text_for_export(data: Dict[str, Any]) -> str:
     lines.append(f"- 상황 설명: {st.session_state.situation}")
     lines.append(f"- 목표: {st.session_state.goal}")
     lines.append(f"- 옵션: {st.session_state.options or '(없음)'}")
+    if st.session_state.emotion_pre is not None or st.session_state.emotion_post is not None:
+        lines.append(f"- 감정 강도(시작/끝): {st.session_state.emotion_pre} → {st.session_state.emotion_post}")
     lines.append("")
     lines.append("[리포트 JSON]")
     lines.append(json.dumps(data, ensure_ascii=False, indent=2))
@@ -1516,13 +1860,96 @@ def handle_back() -> None:
 
 
 # =========================
-# Sidebar (보조 기능만)
+# Sidebar (보조 기능 + 프라이버시 + 프리셋)
 # =========================
 init_state()
 
 with st.sidebar:
     st.header("보조 메뉴")
     st.text_input("OpenAI API Key (Secrets 우선)", type="password", key="openai_api_key_input")
+
+    st.divider()
+
+    st.subheader("프라이버시 모드")
+    st.toggle("프라이버시 모드", key="privacy_mode")
+    if st.session_state.privacy_mode:
+        st.toggle("답변 기록 숨기기", key="hide_history")
+        st.toggle("내보내기 마스킹(권장)", key="mask_export")
+        st.caption("프라이버시 모드는 ‘표시/공유 위험’을 낮추는 옵션입니다(완전 익명화는 아님).")
+    else:
+        st.session_state.hide_history = False
+
+    st.divider()
+    st.subheader("세션 템플릿(프리셋)")
+    st.caption("카테고리/결정유형/코치/질문개수를 저장해 다음에 빠르게 시작할 수 있어요.")
+
+    with st.expander("프리셋 저장/불러오기"):
+        tpl_name = st.text_input("프리셋 이름", placeholder="예: 커리어 결정(구조 코치)")
+        colx, coly = st.columns(2)
+        with colx:
+            if st.button("현재 설정 저장", use_container_width=True):
+                if tpl_name.strip():
+                    st.session_state.saved_templates.append(
+                        {
+                            "name": tpl_name.strip(),
+                            "category": st.session_state.category,
+                            "decision_type": st.session_state.decision_type,
+                            "coach_id": st.session_state.coach_id,
+                            "num_questions": int(st.session_state.num_questions),
+                            "saved_at": datetime.now().isoformat(timespec="seconds"),
+                        }
+                    )
+                    st.success("저장했어요.")
+                else:
+                    st.warning("프리셋 이름을 입력해 주세요.")
+        with coly:
+            if st.button("프리셋 전체 내보내기(JSON)", use_container_width=True):
+                pass  # 아래 download_button로 대체
+
+        if st.session_state.saved_templates:
+            names = [t["name"] for t in st.session_state.saved_templates]
+            picked = st.selectbox("불러올 프리셋", names, index=0)
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("불러오기(현재 설정에 적용)", use_container_width=True):
+                    t = next((x for x in st.session_state.saved_templates if x["name"] == picked), None)
+                    if t:
+                        st.session_state.category = t["category"]
+                        st.session_state.decision_type = t["decision_type"]
+                        st.session_state.coach_id = t["coach_id"]
+                        st.session_state.num_questions = int(t["num_questions"])
+                        st.success("적용했어요.")
+            with col2:
+                if st.button("삭제", use_container_width=True):
+                    st.session_state.saved_templates = [x for x in st.session_state.saved_templates if x["name"] != picked]
+                    st.success("삭제했어요.")
+                    st.rerun()
+
+            st.download_button(
+                "프리셋 JSON 다운로드",
+                data=json.dumps(st.session_state.saved_templates, ensure_ascii=False, indent=2).encode("utf-8"),
+                file_name="pebble_templates.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+            up = st.file_uploader("프리셋 JSON 불러오기", type=["json"])
+            if up is not None:
+                try:
+                    loaded = json.loads(up.read().decode("utf-8"))
+                    if isinstance(loaded, list):
+                        # 단순 병합(동명 중복은 뒤에 추가)
+                        for item in loaded:
+                            if isinstance(item, dict) and "name" in item:
+                                st.session_state.saved_templates.append(item)
+                        st.success("불러왔어요.")
+                        st.rerun()
+                    else:
+                        st.warning("형식이 올바르지 않습니다(리스트 JSON이어야 해요).")
+                except Exception:
+                    st.warning("JSON을 읽는 데 실패했어요.")
+        else:
+            st.caption("저장된 프리셋이 아직 없어요.")
 
     st.divider()
     if st.button("처음부터 다시 하기", use_container_width=True):
@@ -1577,6 +2004,8 @@ def render_landing() -> None:
         st.caption("지금 고민 중인 상황을 자유롭게 적어주세요.")
 
         with st.container(border=True):
+            if st.session_state.privacy_mode:
+                st.caption("프라이버시 모드: 입력은 동일하지만 화면 공유 시 주의가 덜 되도록 일부 표시를 줄입니다.")
             st.text_area(
                 "고민 내용",
                 key="user_problem",
@@ -1633,7 +2062,10 @@ def render_setup_details() -> None:
             st.rerun()
 
     with st.container(border=True):
-        st.write(problem_text)
+        if st.session_state.privacy_mode:
+            st.write("프라이버시 모드: (표시 숨김) — 이 영역은 화면 공유 시 민감할 수 있어요.")
+        else:
+            st.write(problem_text)
 
     reco = st.session_state.onboarding_reco or {}
 
@@ -1722,7 +2154,7 @@ def render_setup_details() -> None:
             st.session_state.probe_question = ""
             st.session_state.probe_for_index = None
             st.session_state.probe_mode = ""
-            st.session_state.crosscheck_used_for = set()
+            st.session_state.crosscheck_used_for = []
             st.session_state.final_report_json = None
             st.session_state.final_report_raw = None
             st.session_state.decision_matrix_df = None
@@ -1732,11 +2164,18 @@ def render_setup_details() -> None:
 
 def render_questions() -> None:
     st.title("질문")
-    st.caption("한 화면에 한 질문. 답변이 10자 미만이면 구체화 질문, '잘 모르겠어요'면 재프레이밍 질문을 1회 제공합니다.")
+    st.caption("한 화면에 한 질문. 답변이 10자 미만이면 구체화 질문, ‘난감(정보 부족)’이면 재프레이밍 질문을 1회 제공합니다.")
 
     nq = int(st.session_state.num_questions)
     q_idx = int(st.session_state.q_index)
     q_idx = max(0, min(q_idx, nq - 1))
+
+    # 감정 트래킹: 질문 시작 전에 한 번만(첫 질문에서만)
+    if q_idx == 0 and st.session_state.emotion_pre is None:
+        st.subheader("시작 전 셀프 체크(1초)")
+        st.caption("지금 마음의 무게/불편함/긴장 정도를 1~5로 찍어주세요(정답 없음).")
+        st.session_state.emotion_pre = st.slider("현재 감정 강도", 1, 5, 3, key="emotion_pre_slider")
+        st.divider()
 
     ensure_question(q_idx, nq)
     main_q = st.session_state.questions[q_idx]
@@ -1744,10 +2183,7 @@ def render_questions() -> None:
     if st.session_state.probe_active and st.session_state.probe_for_index == q_idx:
         show_q = st.session_state.probe_question
         kind = "probe"
-        if st.session_state.probe_mode == "reframe":
-            badge = "도움 질문(재프레이밍)"
-        else:
-            badge = "추가 질문(구체화)"
+        badge = "도움 질문(재프레이밍)" if st.session_state.probe_mode == "reframe" else "추가 질문(구체화)"
     else:
         show_q = main_q
         kind = "main"
@@ -1766,11 +2202,7 @@ def render_questions() -> None:
         st.markdown(f"**{show_q}**")
 
     with st.form(f"answer_form_{q_idx}_{kind}", clear_on_submit=True):
-        hint = ""
-        if st.session_state.answers:
-            last_a = st.session_state.answers[-1]["a"]
-            hint = f"이전 답 요약: {last_a[:90]}{'…' if len(last_a) > 90 else ''}"
-        ans = st.text_area("답변", placeholder=hint or "여기에 답변을 입력하세요", height=150)
+        ans = st.text_area("답변", placeholder="여기에 답변을 입력하세요", height=150)
         submitted = st.form_submit_button("답변 저장", use_container_width=True)
 
     if submitted:
@@ -1791,7 +2223,7 @@ def render_questions() -> None:
             # main answer 저장
             add_answer(show_q, a, kind="main", main_index=q_idx, subkind="")
 
-            # 1) 난감 답변이면: 재프레이밍 질문 1회 제공(다음 단계로 안 넘어감)
+            # 1) 난감(키워드+정보부족) 답변이면: 재프레이밍 질문 1회 제공(다음 단계로 안 넘어감)
             if is_confused_answer(a):
                 rq, err, dbg = generate_reframe_question(show_q, a)
                 st.session_state.debug_log = dbg
@@ -1820,21 +2252,45 @@ def render_questions() -> None:
                 st.session_state.q_index = min(q_idx + 1, nq - 1)
             st.rerun()
 
-    with st.expander("답변 기록"):
-        grouped: Dict[int, List[Dict[str, Any]]] = {}
-        for qa in st.session_state.answers:
-            grouped.setdefault(int(qa.get("main_index", 0)), []).append(qa)
+    # 프라이버시 모드: 답변 기록 숨기기 토글 지원
+    if not (st.session_state.privacy_mode and st.session_state.hide_history):
+        with st.expander("답변 기록"):
+            grouped: Dict[int, List[Dict[str, Any]]] = {}
+            for qa in st.session_state.answers:
+                grouped.setdefault(int(qa.get("main_index", 0)), []).append(qa)
 
-        for mi in sorted(grouped.keys()):
-            st.markdown(f"### Q{mi + 1}")
-            for qa in grouped[mi]:
-                tag = "PROBE" if qa.get("kind") == "probe" else "MAIN"
-                sub = qa.get("subkind", "")
-                tag2 = f"{tag}:{sub}" if sub else tag
-                st.markdown(f"**({tag2}) {qa['q']}**")
-                st.write(qa["a"])
-                st.caption(qa["ts"])
-                st.divider()
+            for mi in sorted(grouped.keys()):
+                st.markdown(f"### Q{mi + 1}")
+                for qa in grouped[mi]:
+                    tag = "PROBE" if qa.get("kind") == "probe" else "MAIN"
+                    sub = qa.get("subkind", "")
+                    tag2 = f"{tag}:{sub}" if sub else tag
+                    st.markdown(f"**({tag2}) {qa['q']}**")
+                    st.write(qa["a"])
+                    st.caption(qa["ts"])
+                    st.divider()
+    else:
+        st.caption("프라이버시 모드: 답변 기록이 숨김 처리되었습니다.")
+
+
+def render_emotion_delta_block() -> None:
+    st.subheader("감정 변화(셀프 체크)")
+    pre = st.session_state.emotion_pre
+    post = st.session_state.emotion_post
+    if pre is None:
+        st.caption("시작 전 감정 강도가 기록되지 않았어요.")
+        return
+
+    if post is None:
+        st.caption("끝난 뒤 감정 강도를 아직 기록하지 않았어요.")
+        return
+
+    delta = int(post) - int(pre)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("시작", str(pre))
+    c2.metric("끝", str(post))
+    c3.metric("변화(끝-시작)", f"{delta:+d}")
+    st.caption("이 값은 ‘좋고 나쁨’이 아니라, 정리 전/후의 체감 변화를 관찰하기 위한 기록이에요.")
 
 
 def render_report() -> None:
@@ -1847,6 +2303,12 @@ def render_report() -> None:
     if st.session_state.report_just_entered:
         st.balloons()
         st.session_state.report_just_entered = False
+
+    # 감정 트래킹: 리포트에서 post 기록
+    st.subheader("끝난 뒤 셀프 체크(1초)")
+    st.caption("정리를 마친 지금의 감정 강도를 1~5로 찍어주세요(정답 없음).")
+    st.session_state.emotion_post = st.slider("현재 감정 강도", 1, 5, 3, key="emotion_post_slider")
+    st.divider()
 
     if main_answer_count() < nq:
         st.warning("아직 모든 메인 질문이 완료되지 않았습니다. 질문 페이지로 돌아가 답변을 완료하세요.")
@@ -1879,10 +2341,16 @@ def render_report() -> None:
     if data:
         st.success("최종 정리가 준비되었습니다.")
 
+        render_emotion_delta_block()
         render_summary_block(data)
+
+        # 1) 기준
         criteria_names = render_criteria(data)
+
+        # 2) 매트릭스
         render_decision_matrix(criteria_names, data)
 
+        # 3) 코치별 블록
         if coach["id"] == "action":
             render_action_visualization(data)
         elif coach["id"] == "logic":
@@ -1890,12 +2358,48 @@ def render_report() -> None:
         else:
             render_emotions_values(data)
 
+        # 4) 모순/긴장 지도(신규)
+        render_tension_map(data)
+
+        # 5) 정보 부족 체크리스트(신규)
+        render_info_check_questions(data)
+
+        # 6) mirroring 시각화(기존)
         render_mirroring_visual()
+
+        # 7) 코칭 메시지 + 다음 질문
         render_coaching_message(data)
         render_next_question(data)
 
+        # 8) 다음 세션 연결(신규)
+        st.subheader("다음 세션으로 연결하기")
+        st.caption("아래 질문에 답한 내용을 ‘다음 세션의 시작 고민’으로 삼을 수 있어요(추천 아님).")
+        nsq = str(data.get("next_self_question", "") or "").strip()
+        if nsq:
+            st.write(f"**질문:** {nsq}")
+        next_seed = st.text_area("내 답변(다음 세션 시작용)", height=120, placeholder="예: 내가 놓치기 싫은 기준은 …")
+        colx, coly = st.columns([1, 1])
+        with colx:
+            if st.button("이 답변으로 새 세션 시작", use_container_width=True):
+                if next_seed.strip():
+                    st.session_state.user_problem = next_seed.strip()
+                    reset_flow("setup_details", keep_problem=True)
+                    st.session_state.page = "setup_details"
+                    st.rerun()
+                else:
+                    st.warning("답변을 한 줄이라도 입력해 주세요.")
+        with coly:
+            if st.button("그냥 랜딩으로", use_container_width=True):
+                reset_flow("landing", keep_problem=False)
+                st.rerun()
+
+        # 9) 공유/저장
         st.subheader("공유/저장")
         export_text = build_report_text_for_export(data)
+
+        if st.session_state.privacy_mode and st.session_state.mask_export:
+            export_text = mask_text_for_privacy(export_text)
+
         render_copy_to_clipboard_button(export_text, "리포트 텍스트 복사")
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1908,7 +2412,10 @@ def render_report() -> None:
         )
 
         st.subheader("공유용(JSON)")
-        st.code(json.dumps(data, ensure_ascii=False, indent=2), language="json")
+        json_text = json.dumps(data, ensure_ascii=False, indent=2)
+        if st.session_state.privacy_mode and st.session_state.mask_export:
+            json_text = mask_text_for_privacy(json_text)
+        st.code(json_text, language="json")
 
         if contains_forbidden_recommendation(json.dumps(data, ensure_ascii=False)):
             st.warning("리포트에 추천/지시처럼 보이는 표현이 섞였을 수 있어요. 필요하면 ‘정리 생성/새로고침’을 눌러 보세요.")
