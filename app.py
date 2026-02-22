@@ -8,13 +8,12 @@
 # - 이전 답변 반영 동적 질문 생성
 # - 마지막: 고민의 핵심 / 선택 기준 / 코칭 메시지(거울 비추기, 추천 금지)
 #
-# 이번 반영(토큰 비용 관리):
-# ✅ “요약 버퍼(summary buffer)” 도입
-# - 프롬프트에 Q/A 전체 누적 금지
-# - 최근 3~4개 Q/A만 보내고
-# - 그 이전 내용은 세션 요약(summary_buffer)로 압축해 컨텍스트로 제공
-# - 요약은 3개 메인 답변마다(또는 설정된 주기) 자동 업데이트
-# - OpenAI 실패 시 규칙 기반 요약으로 fallback
+# 이번 반영:
+# ✅ “요약 버퍼(summary buffer)” 도입 (토큰 비용 관리)
+# ✅ Google Gemini API Key 입력 추가 + (질문/프로브/크로스체크 생성에) Gemini 보조 사용 옵션
+#    - OpenAI 실패 시 Gemini로 자동 fallback
+#    - (기본값) Gemini 키가 있으면 질문 생성에서 Gemini를 한 번 더 호출해 후보를 비교 → 더 나은 질문 선택
+#      *비용은 증가할 수 있음*
 # ─────────────────────────────────────────────────────────────
 
 from __future__ import annotations
@@ -30,10 +29,17 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 import streamlit as st
 
+# OpenAI
 try:
     from openai import OpenAI
 except Exception:
     OpenAI = None  # type: ignore
+
+# Gemini
+try:
+    import google.generativeai as genai  # pip install google-generativeai
+except Exception:
+    genai = None  # type: ignore
 
 
 # =========================
@@ -41,8 +47,13 @@ except Exception:
 # =========================
 st.set_page_config(page_title="돌멩이 AI 결정 코칭", page_icon="🪨", layout="wide")
 
+# OpenAI models
 MODEL_PRIMARY = "gpt-5-mini"
 MODEL_FALLBACK = "gpt-4o-mini"
+
+# Gemini models (가급적 안정적인 라인업)
+GEMINI_MODEL_PRIMARY = "gemini-1.5-flash"
+GEMINI_MODEL_FALLBACK = "gemini-1.5-pro"
 
 TOPIC_CATEGORIES = [
     ("🎓 학업/진로", "학업, 전공 선택, 진로 방향, 취업/이직, 목표 설정"),
@@ -271,9 +282,9 @@ def render_hero_pebble(progress: float, label: str) -> None:
 
 
 # =========================
-# OpenAI
+# Keys / Clients
 # =========================
-def get_api_key() -> str:
+def get_openai_api_key() -> str:
     try:
         k = st.secrets.get("OPENAI_API_KEY", "")  # type: ignore
         if k:
@@ -283,68 +294,245 @@ def get_api_key() -> str:
     return str(st.session_state.get("openai_api_key_input", "")).strip()
 
 
-def get_client(api_key: str) -> "OpenAI":
+def get_gemini_api_key() -> str:
+    try:
+        k = st.secrets.get("GEMINI_API_KEY", "")  # type: ignore
+        if k:
+            return str(k).strip()
+    except Exception:
+        pass
+    return str(st.session_state.get("gemini_api_key_input", "")).strip()
+
+
+def get_openai_client(api_key: str) -> "OpenAI":
     if OpenAI is None:
         raise RuntimeError("openai 패키지가 설치되어 있지 않습니다. `pip install openai`를 실행하세요.")
     return OpenAI(api_key=api_key)
 
 
-def call_openai_text(system: str, user: str, temperature: float = 0.6) -> Tuple[Optional[str], Optional[str], List[str]]:
+def _gemini_configure(api_key: str) -> None:
+    if genai is None:
+        raise RuntimeError("google-generativeai 패키지가 설치되어 있지 않습니다. `pip install google-generativeai`를 실행하세요.")
+    genai.configure(api_key=api_key)
+
+
+def _gemini_generate_text(
+    system: str,
+    user: str,
+    temperature: float = 0.6,
+    model_name: str = GEMINI_MODEL_PRIMARY,
+) -> str:
+    """
+    google-generativeai API (단순 텍스트 생성)
+    - system instruction을 별도로 주기 위해, system+user를 합쳐 전달합니다.
+    """
+    if genai is None:
+        raise RuntimeError("Gemini SDK가 없습니다.")
+    model = genai.GenerativeModel(model_name=model_name)
+    # system+user 결합(간단/호환성)
+    prompt = f"[SYSTEM]\n{system}\n\n[USER]\n{user}\n"
+    resp = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            temperature=float(temperature),
+            # top_p/top_k/max_output_tokens는 필요 시 추가
+        ),
+    )
+    txt = getattr(resp, "text", None) or ""
+    return str(txt).strip()
+
+
+# =========================
+# LLM Caller (OpenAI + Gemini)
+# =========================
+def _looks_like_single_question(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+    # 질문 1개만 원칙(너무 길거나 줄이 많으면 감점)
+    if t.count("\n") >= 2:
+        return False
+    # 한국어 질문 종결 패턴
+    if ("?" in t) or t.endswith("요") or t.endswith("까요") or t.endswith("나요"):
+        return True
+    return False
+
+
+def _score_question_candidate(text: str) -> float:
+    """
+    질문 후보를 비교하기 위한 휴리스틱 점수 (추천/결론 금지 전제)
+    """
+    t = (text or "").strip()
+    if not t:
+        return -999.0
+
+    score = 0.0
+    if "?" in t:
+        score += 2.0
+    if _looks_like_single_question(t):
+        score += 2.0
+
+    # 너무 장황하면 감점(질문은 한 방에)
+    L = len(t)
+    if 15 <= L <= 120:
+        score += 1.5
+    elif L <= 160:
+        score += 0.5
+    else:
+        score -= 1.0
+
+    # 지시/추천 뉘앙스 약간 감점(강하게 막는 건 별도 패턴에서)
+    if re.search(r"(해야|하자|추천|정답|결론)", t):
+        score -= 2.5
+
+    # 숫자/범위/기간/기준을 묻는 느낌이면 가산
+    if re.search(r"(언제|얼마나|기간|기준|우선순위|예시|조건|범위|리스크|최악)", t):
+        score += 0.7
+
+    return score
+
+
+def call_llm_text(
+    system: str,
+    user: str,
+    temperature: float = 0.6,
+    purpose: str = "general",  # "question" | "summary" | "report" | "general"
+) -> Tuple[Optional[str], Optional[str], List[str]]:
+    """
+    1) OpenAI 우선 시도 (키 있으면)
+    2) OpenAI 실패 시 Gemini fallback (키 있으면)
+    3) (질문 목적) Gemini 보조 사용 옵션: OpenAI 결과가 있어도 Gemini 후보를 추가 생성해 더 좋은 질문 선택
+    """
     debug: List[str] = []
-    api_key = get_api_key()
-    if not api_key:
-        return None, "OpenAI API Key가 필요합니다. Secrets에 OPENAI_API_KEY를 넣거나 사이드바에 입력하세요.", debug
 
-    try:
-        client = get_client(api_key)
-    except Exception as e:
-        return None, str(e), debug
+    openai_key = get_openai_api_key()
+    gemini_key = get_gemini_api_key()
 
-    if hasattr(client, "responses"):
-        for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
-            try:
-                debug.append(f"Responses API / model={model}")
-                resp = client.responses.create(
-                    model=model,
-                    input=[
-                        {"role": "system", "content": [{"type": "text", "text": system}]},
-                        {"role": "user", "content": [{"type": "text", "text": user}]},
-                    ],
-                    temperature=temperature,
-                )
-                if getattr(resp, "output_text", None):
-                    return str(resp.output_text).strip(), None, debug
+    use_gemini_boost = bool(st.session_state.get("use_gemini_boost", False))
+    # Gemini 키가 있으면 기본적으로 질문 생성에서 보조 사용(품질↑, 비용↑)
+    if purpose == "question" and gemini_key and "use_gemini_boost" not in st.session_state:
+        use_gemini_boost = True
 
-                out_texts: List[str] = []
-                for item in getattr(resp, "output", []) or []:
-                    for c in getattr(item, "content", []) or []:
-                        if getattr(c, "type", None) == "output_text":
-                            out_texts.append(getattr(c, "text", ""))
-                text = "\n".join([t for t in out_texts if t]).strip()
-                if text:
-                    return text, None, debug
-                raise RuntimeError("응답 텍스트 추출 실패")
-            except Exception as e:
-                debug.append(f"Responses failed: {type(e).__name__}: {e}")
+    # --- 1) OpenAI attempt ---
+    openai_text: Optional[str] = None
+    openai_err: Optional[str] = None
 
-    for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
+    if openai_key:
         try:
-            debug.append(f"Chat Completions / model={model}")
-            cc = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                temperature=temperature,
-            )
-            text = ""
-            if cc.choices:
-                text = (cc.choices[0].message.content or "").strip()
-            if text:
-                return text, None, debug
-            raise RuntimeError("빈 응답")
-        except Exception as e:
-            debug.append(f"Chat failed: {type(e).__name__}: {e}")
+            client = get_openai_client(openai_key)
+            if hasattr(client, "responses"):
+                for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
+                    try:
+                        debug.append(f"OpenAI Responses API / model={model}")
+                        resp = client.responses.create(
+                            model=model,
+                            input=[
+                                {"role": "system", "content": [{"type": "text", "text": system}]},
+                                {"role": "user", "content": [{"type": "text", "text": user}]},
+                            ],
+                            temperature=temperature,
+                        )
+                        if getattr(resp, "output_text", None):
+                            openai_text = str(resp.output_text).strip()
+                            openai_err = None
+                            break
 
-    return None, "OpenAI 호출에 실패했습니다. 아래 디버그 로그를 확인하세요.", debug
+                        out_texts: List[str] = []
+                        for item in getattr(resp, "output", []) or []:
+                            for c in getattr(item, "content", []) or []:
+                                if getattr(c, "type", None) == "output_text":
+                                    out_texts.append(getattr(c, "text", ""))
+                        txt = "\n".join([t for t in out_texts if t]).strip()
+                        if txt:
+                            openai_text = txt
+                            openai_err = None
+                            break
+                        raise RuntimeError("응답 텍스트 추출 실패")
+                    except Exception as e:
+                        debug.append(f"OpenAI Responses failed: {type(e).__name__}: {e}")
+                        openai_err = str(e)
+
+            if not openai_text:
+                for model in [MODEL_PRIMARY, MODEL_FALLBACK]:
+                    try:
+                        debug.append(f"OpenAI Chat Completions / model={model}")
+                        cc = client.chat.completions.create(
+                            model=model,
+                            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                            temperature=temperature,
+                        )
+                        txt = ""
+                        if cc.choices:
+                            txt = (cc.choices[0].message.content or "").strip()
+                        if txt:
+                            openai_text = txt
+                            openai_err = None
+                            break
+                        raise RuntimeError("빈 응답")
+                    except Exception as e:
+                        debug.append(f"OpenAI Chat failed: {type(e).__name__}: {e}")
+                        openai_err = str(e)
+        except Exception as e:
+            debug.append(f"OpenAI init/call error: {type(e).__name__}: {e}")
+            openai_err = str(e)
+
+    # --- 2) Gemini fallback / boost ---
+    gemini_text: Optional[str] = None
+    gemini_err: Optional[str] = None
+
+    def try_gemini_once(model_name: str) -> Optional[str]:
+        nonlocal gemini_err
+        if not gemini_key:
+            gemini_err = "Google Gemini API Key가 필요합니다."
+            return None
+        try:
+            _gemini_configure(gemini_key)
+            debug.append(f"Gemini / model={model_name}")
+            txt = _gemini_generate_text(system=system, user=user, temperature=temperature, model_name=model_name)
+            if txt:
+                return txt
+            gemini_err = "Gemini 빈 응답"
+            return None
+        except Exception as e:
+            gemini_err = f"{type(e).__name__}: {e}"
+            debug.append(f"Gemini failed: {gemini_err}")
+            return None
+
+    # Gemini를 먼저 쓰는 정책은 아니고:
+    # - OpenAI 실패 시 fallback
+    # - 질문 purpose + boost on 이면 후보 추가 생성
+    if (not openai_text) and gemini_key:
+        gemini_text = try_gemini_once(GEMINI_MODEL_PRIMARY) or try_gemini_once(GEMINI_MODEL_FALLBACK)
+
+    if purpose == "question" and use_gemini_boost and gemini_key:
+        # OpenAI가 있든 없든 Gemini 후보를 추가로 생성해 비교 (단, OpenAI가 완전히 없고 gemini_text가 이미 있으면 추가 호출 생략)
+        if openai_text and not gemini_text:
+            gemini_text = try_gemini_once(GEMINI_MODEL_PRIMARY) or try_gemini_once(GEMINI_MODEL_FALLBACK)
+
+        # 후보 비교
+        cand1 = (openai_text or "").strip()
+        cand2 = (gemini_text or "").strip()
+        if cand1 and cand2:
+            s1 = _score_question_candidate(cand1)
+            s2 = _score_question_candidate(cand2)
+            debug.append(f"Candidate score: OpenAI={s1:.2f}, Gemini={s2:.2f}")
+            if s2 > s1:
+                debug.append("Selected Gemini candidate for better question quality.")
+                return cand2, None, debug
+            return cand1, None, debug
+
+    # 최종 반환 우선순위: OpenAI → Gemini
+    if openai_text:
+        return openai_text.strip(), None, debug
+    if gemini_text:
+        return gemini_text.strip(), None, debug
+
+    # 둘 다 없으면 에러
+    if not openai_key and not gemini_key:
+        return None, "OpenAI API Key 또는 Google Gemini API Key가 필요합니다. Secrets에 넣거나 사이드바에 입력하세요.", debug
+
+    # 키는 있는데 둘 다 실패한 경우
+    return None, (openai_err or gemini_err or "모델 호출에 실패했습니다. 디버그 로그를 확인하세요."), debug
 
 
 # =========================
@@ -435,12 +623,18 @@ def init_state() -> None:
         st.session_state.debug_log = []
     if "openai_api_key_input" not in st.session_state:
         st.session_state.openai_api_key_input = ""
+    if "gemini_api_key_input" not in st.session_state:
+        st.session_state.gemini_api_key_input = ""
 
     # ✅ 요약 버퍼 상태
     if "summary_buffer" not in st.session_state:
         st.session_state.summary_buffer = ""  # str
     if "summarized_main_count" not in st.session_state:
-        st.session_state.summarized_main_count = 0  # int (요약에 포함된 메인 답변 개수)
+        st.session_state.summarized_main_count = 0  # int
+
+    # ✅ Gemini 보조 사용 토글(기본값은 call_llm_text에서 question 목적일 때 키 존재 시 True로 처리)
+    if "use_gemini_boost" not in st.session_state:
+        st.session_state.use_gemini_boost = False
 
 
 def reset_flow(to_page: str = "landing", keep_problem: bool = False) -> None:
@@ -644,18 +838,12 @@ def safe_json_parse(text: str) -> Optional[Dict[str, Any]]:
 # ✅ Summary Buffer (Token Cost Control)
 # =========================
 def _summarize_fallback_rules(mains: List[Dict[str, Any]], limit_chars: int = 1200) -> str:
-    """
-    OpenAI 호출 실패 시 규칙 기반 요약:
-    - 각 답변의 첫 문장/앞부분만 추출
-    - 중복 줄이고 길이 제한
-    """
     bullets: List[str] = []
     for qa in mains:
         a = normalize(str(qa.get("a", "")))
         if not a:
             continue
-        first = re.split(r"[.!?。\n]", a)[0]
-        first = first.strip()
+        first = re.split(r"[.!?。\n]", a)[0].strip()
         if len(first) < 6:
             first = a[:60].strip()
         if first:
@@ -697,26 +885,18 @@ def _summary_user_prompt(existing_summary: str, new_mains: List[Dict[str, Any]])
 
 
 def update_summary_buffer_if_needed() -> None:
-    """
-    - 메인 답변이 누적되면, 너무 오래된 Q/A는 요약 버퍼로 축약하고
-      질문 생성 프롬프트에는 (요약 + 최근 Q/A)만 보내도록 한다.
-    - 3개 메인 답변마다(또는 설정) 요약 버퍼 업데이트
-    """
     mains = [x for x in st.session_state.answers if x.get("kind") == "main"]
     mcount = len(mains)
     summarized = int(st.session_state.summarized_main_count or 0)
 
-    # 요약할 게 없거나, 아직 업데이트 주기 미도달이면 종료
     if mcount < SUMMARY_UPDATE_EVERY:
         return
     if mcount - summarized < SUMMARY_UPDATE_EVERY:
         return
 
-    # ✅ 최근 window는 요약에서 제외(항상 원문으로 보내기 위함)
     keep_recent = RECENT_QA_WINDOW
     cutoff = max(0, mcount - keep_recent)
 
-    # 이미 요약된 구간 이후부터 cutoff까지가 "새로 요약할 메인 Q/A"
     start = summarized
     end = min(cutoff, mcount)
 
@@ -730,16 +910,14 @@ def update_summary_buffer_if_needed() -> None:
     system = _summary_system_prompt()
     user = _summary_user_prompt(st.session_state.summary_buffer or "", new_chunk)
 
-    txt, err, dbg = call_openai_text(system=system, user=user, temperature=0.2)
+    txt, err, dbg = call_llm_text(system=system, user=user, temperature=0.2, purpose="summary")
     st.session_state.debug_log = dbg
 
     if txt and txt.strip():
-        # 방어: 너무 길면 컷
         merged = txt.strip()
         merged = merged[:1200].rstrip()
         st.session_state.summary_buffer = merged
     else:
-        # fallback: 기존 요약 + 규칙 요약을 합쳐 길이 제한
         merged = (st.session_state.summary_buffer or "").strip()
         add = _summarize_fallback_rules(new_chunk, limit_chars=700)
         merged2 = (merged + ("\n" if merged and add else "") + add).strip()
@@ -752,19 +930,10 @@ def update_summary_buffer_if_needed() -> None:
 # Context builder (token friendly)
 # =========================
 def build_context_block() -> str:
-    """
-    ✅ 변경점:
-    - Q/A 전체 누적 금지
-    - (요약 버퍼) + (최근 3~4개 Q/A)만 프롬프트에 포함
-    """
     opts = parse_options()
     opts_txt = "\n".join([f"- {o}" for o in opts]) if opts else "(미입력)"
 
-    # 최근 Q/A (메인+프로브 섞이지 않게 “최근 answers” 중 마지막 몇 개만)
-    # 질문 생성에는 "최근 상호작용"이 도움이 되므로 answers에서 tail을 잡되, 길이는 제한
-    tail = st.session_state.answers[-(RECENT_QA_WINDOW * 2) :]  # probe 포함 여지 -> 조금 넉넉히
-    # 그러나 너무 길어지지 않도록 최종적으로 최대 RECENT_QA_WINDOW개 “블록”만 남김
-    # (여기서는 단순히 끝에서부터 RECENT_QA_WINDOW개만 사용)
+    tail = st.session_state.answers[-(RECENT_QA_WINDOW * 2) :]
     tail = tail[-RECENT_QA_WINDOW:] if len(tail) > RECENT_QA_WINDOW else tail
 
     hist = ""
@@ -773,7 +942,6 @@ def build_context_block() -> str:
         sub = qa.get("subkind", "")
         tag2 = f"{tag}:{sub}" if sub else tag
         a = str(qa.get("a", ""))
-        # 답변이 너무 길면 잘라서 토큰 폭증 방지
         a_short = a.strip()
         if len(a_short) > 420:
             a_short = a_short[:420].rstrip() + "…"
@@ -877,7 +1045,7 @@ def onboarding_fallback(problem_text: str) -> Dict[str, Any]:
 def generate_onboarding_recommendation(problem_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str], List[str], Optional[str]]:
     system = system_prompt_for_onboarding()
     user = user_prompt_for_onboarding(problem_text)
-    txt, err, dbg = call_openai_text(system=system, user=user, temperature=0.2)
+    txt, err, dbg = call_llm_text(system=system, user=user, temperature=0.2, purpose="general")
     if not txt:
         fb = onboarding_fallback(problem_text)
         dbg.append("Onboarding fallback used (no model output).")
@@ -958,7 +1126,7 @@ def crosscheck_system_prompt() -> str:
 
 def crosscheck_user_prompt(current_main_index: int) -> str:
     mains = [x for x in st.session_state.answers if x.get("kind") == "main"]
-    tail = mains[-6:]  # crosscheck는 짧게 유지(이미 비용 관리됨)
+    tail = mains[-6:]
     qa = ""
     for i, x in enumerate(tail, start=1):
         qa += f"{i}) Q: {x['q']}\n   A: {x['a']}\n"
@@ -996,7 +1164,7 @@ def try_logic_crosscheck_question(main_index: int) -> Tuple[Optional[str], List[
 
     system = crosscheck_system_prompt()
     user = crosscheck_user_prompt(main_index)
-    txt, err, d = call_openai_text(system=system, user=user, temperature=0.2)
+    txt, err, d = call_llm_text(system=system, user=user, temperature=0.2, purpose="question")
     dbg.extend(d)
     if not txt:
         if err:
@@ -1116,7 +1284,7 @@ def generate_question(i: int, n: int) -> Tuple[str, Optional[str], List[str]]:
             """
         ).strip()
 
-    q1, err, dbg = call_openai_text(system=system, user=prompt(random.randint(1000, 9999)), temperature=0.7)
+    q1, err, dbg = call_llm_text(system=system, user=prompt(random.randint(1000, 9999)), temperature=0.7, purpose="question")
     dbg_acc.extend(dbg)
     if not q1:
         return fallback_question(coach["id"], i, n), err, dbg_acc
@@ -1126,7 +1294,7 @@ def generate_question(i: int, n: int) -> Tuple[str, Optional[str], List[str]]:
         return q1, None, dbg_acc
 
     dbg_acc.append("Similar question detected. Regenerating once.")
-    q2, err2, dbg2 = call_openai_text(system=system, user=prompt(random.randint(10000, 99999)), temperature=0.85)
+    q2, err2, dbg2 = call_llm_text(system=system, user=prompt(random.randint(10000, 99999)), temperature=0.85, purpose="question")
     dbg_acc.extend(dbg2)
     if q2:
         q2 = normalize(q2)
@@ -1149,7 +1317,7 @@ def generate_probe_question(last_q: str, last_a: str) -> Tuple[str, Optional[str
     coach = coach_by_id(st.session_state.coach_id)
     system = system_prompt_for_questions(coach)
     user = probing_instruction(last_q, last_a)
-    q, err, dbg = call_openai_text(system=system, user=user, temperature=0.6)
+    q, err, dbg = call_llm_text(system=system, user=user, temperature=0.6, purpose="question")
     if not q:
         return "방금 답변에서 ‘예시 1개’만 들어서 조금 더 자세히 설명해줄 수 있을까요?", err, dbg
     return normalize(q), None, dbg
@@ -1159,14 +1327,14 @@ def generate_reframe_question(last_q: str, last_a: str) -> Tuple[str, Optional[s
     coach = coach_by_id(st.session_state.coach_id)
     system = system_prompt_for_questions(coach)
     user = reframe_instruction(last_q, last_a)
-    q, err, dbg = call_openai_text(system=system, user=user, temperature=0.55)
+    q, err, dbg = call_llm_text(system=system, user=user, temperature=0.55, purpose="question")
     if not q:
         return "이 질문이 어렵다면, ‘이번 상황에서 가장 신경 쓰이는 한 가지’만 고르면 무엇인가요?", err, dbg
     return normalize(q), None, dbg
 
 
 # =========================
-# Report generation + rendering (원본 그대로: 여기서는 지면상 생략하지 않고 포함)
+# Report generation + rendering
 # =========================
 FORBIDDEN_RECOMMEND_PATTERNS = [
     r"추천합니다",
@@ -1274,7 +1442,7 @@ def build_qa_text_for_report() -> str:
 def fallback_report_json() -> Dict[str, Any]:
     coach = coach_by_id(st.session_state.coach_id)
     opts = parse_options()
-    base = {
+    base: Dict[str, Any] = {
         "summary": {
             "core_issue": normalize(st.session_state.situation)[:180] or "핵심 고민이 요약되지 않았습니다.",
             "goal": normalize(st.session_state.goal)[:180] or "목표가 명확히 적히지 않았습니다.",
@@ -1330,7 +1498,7 @@ def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str
 """
     ).strip()
 
-    text, err, dbg = call_openai_text(system=system, user=user, temperature=0.25)
+    text, err, dbg = call_llm_text(system=system, user=user, temperature=0.25, purpose="report")
     if not text:
         fb = fallback_report_json()
         dbg.append("Report fallback used (no model output).")
@@ -1346,7 +1514,7 @@ def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str
     if contains_forbidden_recommendation(combined):
         dbg.append("Forbidden phrasing detected. Regenerating once.")
         stricter_user = user + "\n\n[경고] 추천/지시 표현 금지. 거울 비추기만."
-        text2, err2, dbg2 = call_openai_text(system=system, user=stricter_user, temperature=0.1)
+        text2, err2, dbg2 = call_llm_text(system=system, user=stricter_user, temperature=0.1, purpose="report")
         dbg.extend(dbg2)
         if text2:
             data2 = safe_json_parse(text2)
@@ -1358,8 +1526,7 @@ def generate_final_report_json() -> Tuple[Optional[Dict[str, Any]], Optional[str
 
 
 # =========================
-# UI helpers (리포트 렌더링 등) - 이전 버전과 동일
-# (길이 때문에 기능을 ‘삭제’하지 않고 그대로 포함합니다)
+# UI helpers (리포트 렌더링 등)
 # =========================
 def render_summary_block(data: Dict[str, Any]) -> None:
     s = data.get("summary", {}) or {}
@@ -1767,7 +1934,18 @@ init_state()
 
 with st.sidebar:
     st.header("보조 메뉴")
+
     st.text_input("OpenAI API Key (Secrets 우선)", type="password", key="openai_api_key_input")
+    # ✅ Gemini 키 입력 추가 (OpenAI 키 아래)
+    st.text_input("Google Gemini API Key (Secrets 우선)", type="password", key="gemini_api_key_input")
+
+    # ✅ Gemini 보조 사용 토글
+    has_gemini = bool(get_gemini_api_key())
+    if has_gemini:
+        st.toggle("Gemini 보조 사용(질문 품질↑, 호출 비용↑)", key="use_gemini_boost")
+        st.caption("ON이면 질문/프로브/크로스체크 생성에서 Gemini 후보를 추가로 생성해 더 좋은 질문을 선택합니다.")
+    else:
+        st.session_state.use_gemini_boost = False
 
     st.divider()
     st.subheader("프라이버시 모드")
@@ -1870,6 +2048,21 @@ with st.sidebar:
     st.divider()
     with st.expander("디버그 로그"):
         st.write(st.session_state.debug_log)
+
+    st.divider()
+    with st.expander("배포 체크리스트 (Streamlit Cloud)"):
+        st.markdown(
+            """
+- Secrets 설정: Settings → Secrets에
+  - `OPENAI_API_KEY = "sk-..."`
+  - `GEMINI_API_KEY = "..."`  (선택)
+- requirements.txt:
+  - streamlit
+  - openai
+  - pandas
+  - google-generativeai
+"""
+        )
 
 
 # =========================
@@ -2010,7 +2203,7 @@ def render_setup_details() -> None:
             st.info(f"**AI가 이 코치를 추천한 이유(참고):** {reason}")
 
         with st.expander("코치 진행 방식"):
-            st.markdown(f"**{coach['name']}**  \n_{coach['style']}_")
+            st.markdown(f"**{coach['name']}** \n_{coach['style']}_")
             for m in coach["method"]:
                 st.write(f"- {m}")
             st.caption(f"특징: {coach['prompt_hint']}")
@@ -2054,7 +2247,6 @@ def render_setup_details() -> None:
             st.session_state.final_report_raw = None
             st.session_state.decision_matrix_df = None
             st.session_state.page = "questions"
-            # ✅ 요약 버퍼 초기화
             st.session_state.summary_buffer = ""
             st.session_state.summarized_main_count = 0
             st.rerun()
@@ -2064,18 +2256,17 @@ def render_questions() -> None:
     st.title("질문")
     st.caption("프롬프트 비용 관리를 위해: ‘요약 버퍼 + 최근 Q/A’만 모델에 보냅니다.")
 
-    nq = int(st.session_state.num_questions)
+    nq_local = int(st.session_state.num_questions)
     q_idx = int(st.session_state.q_index)
-    q_idx = max(0, min(q_idx, nq - 1))
+    q_idx = max(0, min(q_idx, nq_local - 1))
 
-    # 감정 트래킹: 시작 전 1회
     if q_idx == 0 and st.session_state.emotion_pre is None:
         st.subheader("시작 전 셀프 체크(1초)")
         st.caption("지금 마음의 무게/긴장 정도를 1~5로 찍어주세요.")
         st.session_state.emotion_pre = st.slider("현재 감정 강도", 1, 5, 3, key="emotion_pre_slider")
         st.divider()
 
-    ensure_question(q_idx, nq)
+    ensure_question(q_idx, nq_local)
     main_q = st.session_state.questions[q_idx]
 
     if st.session_state.probe_active and st.session_state.probe_for_index == q_idx:
@@ -2093,9 +2284,9 @@ def render_questions() -> None:
             handle_back()
             st.rerun()
     with top_c3:
-        st.caption(f"메인 답변: {main_answer_count()} / {nq}")
+        st.caption(f"메인 답변: {main_answer_count()} / {nq_local}")
 
-    st.subheader(f"Q{q_idx + 1} / {nq}  ·  {badge}")
+    st.subheader(f"Q{q_idx + 1} / {nq_local}  ·  {badge}")
     with st.container(border=True):
         st.markdown(f"**{show_q}**")
 
@@ -2114,16 +2305,12 @@ def render_questions() -> None:
                 st.session_state.probe_question = ""
                 st.session_state.probe_for_index = None
                 st.session_state.probe_mode = ""
-                st.session_state.q_index = min(q_idx + 1, nq - 1)
+                st.session_state.q_index = min(q_idx + 1, nq_local - 1)
                 st.rerun()
 
-            # main answer 저장
             add_answer(show_q, a, kind="main", main_index=q_idx, subkind="")
-
-            # ✅ 메인 답변 추가 후 요약 버퍼 업데이트(필요 시)
             update_summary_buffer_if_needed()
 
-            # 난감 → 재프레이밍
             if is_confused_answer(a):
                 rq, err, dbg = generate_reframe_question(show_q, a)
                 st.session_state.debug_log = dbg
@@ -2133,7 +2320,6 @@ def render_questions() -> None:
                 st.session_state.probe_mode = "reframe"
                 st.rerun()
 
-            # 짧음 → probing
             if is_too_short_answer(a):
                 pq, err, dbg = generate_probe_question(show_q, a)
                 st.session_state.debug_log = dbg
@@ -2143,12 +2329,12 @@ def render_questions() -> None:
                 st.session_state.probe_mode = "short"
                 st.rerun()
 
-            if main_answer_count() >= nq:
+            if main_answer_count() >= nq_local:
                 st.session_state.page = "report"
                 st.session_state.report_just_entered = True
-                st.session_state.q_index = nq - 1
+                st.session_state.q_index = nq_local - 1
             else:
-                st.session_state.q_index = min(q_idx + 1, nq - 1)
+                st.session_state.q_index = min(q_idx + 1, nq_local - 1)
             st.rerun()
 
     if not (st.session_state.privacy_mode and st.session_state.hide_history):
@@ -2190,7 +2376,7 @@ def render_emotion_delta_block() -> None:
 
 def render_report() -> None:
     coach = coach_by_id(st.session_state.coach_id)
-    nq = int(st.session_state.num_questions)
+    nq_local = int(st.session_state.num_questions)
 
     st.title("최종 정리")
     st.caption("추천/정답 없이, 고민의 핵심과 기준을 ‘거울 비추기’ 방식으로 정리합니다.")
@@ -2204,7 +2390,7 @@ def render_report() -> None:
     st.session_state.emotion_post = st.slider("현재 감정 강도", 1, 5, 3, key="emotion_post_slider")
     st.divider()
 
-    if main_answer_count() < nq:
+    if main_answer_count() < nq_local:
         st.warning("아직 모든 메인 질문이 완료되지 않았습니다.")
         if st.button("질문 페이지로 이동", type="primary"):
             st.session_state.page = "questions"
@@ -2313,16 +2499,4 @@ elif st.session_state.page == "questions":
     render_questions()
 else:
     render_report()
-
-st.divider()
-with st.expander("배포 체크리스트 (Streamlit Cloud)"):
-    st.markdown(
-        """
-- Secrets 설정: Settings → Secrets에 `OPENAI_API_KEY = "sk-..."` 추가
-- requirements.txt:
-  - streamlit
-  - openai
-  - pandas
-"""
-    )
-
+    
